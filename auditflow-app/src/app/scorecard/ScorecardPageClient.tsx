@@ -153,20 +153,30 @@ export default function ScorecardPageClient() {
 
       <DependencyTable dependencies={meta.dependencies} />
 
-      {response.justification && (
-        <JustificationBlock markdown={response.justification} />
-      )}
+      <JustificationBlock
+        markdown={
+          response.justification ||
+          `### Score Summary\nThis audit returned a reproducibility index of **${idx}/100** (${tierLabel(idx)}).\n\n` +
+          `### Execution Result\n` +
+          `Build: ${exec.build_success ? "✓ succeeded" : "✗ failed"} · ` +
+          `Exit code: ${exec.exit_code} · ` +
+          `Real script executed: ${exec.executed_real_script ? "yes" : "no"}.\n\n` +
+          `### Logs\n${exec.logs || "(no logs returned)"}`
+        }
+      />
 
-      {exec.reasoning_log.length > 0 && (
-        <details className="group rounded-2xl border border-white/[0.08] bg-[#0a0a0a] p-4">
-          <summary className="cursor-pointer text-sm font-medium text-white/70">
-            Diagnostic trace ({exec.reasoning_log.length} steps)
-          </summary>
-          <pre className="mt-4 max-h-80 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-white/45">
-            {JSON.stringify(exec.reasoning_log, null, 2)}
-          </pre>
-        </details>
-      )}
+      <details className="group rounded-2xl border border-white/[0.08] bg-[#0a0a0a] p-4">
+        <summary className="cursor-pointer text-sm font-medium text-white/70">
+          {exec.reasoning_log.length > 0
+            ? `Diagnostic trace (${exec.reasoning_log.length} steps)`
+            : "Raw execution logs"}
+        </summary>
+        <pre className="mt-4 max-h-80 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-white/45">
+          {exec.reasoning_log.length > 0
+            ? JSON.stringify(exec.reasoning_log, null, 2)
+            : exec.logs || "(no logs)"}
+        </pre>
+      </details>
     </div>
   );
 }

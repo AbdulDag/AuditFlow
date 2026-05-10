@@ -43,5 +43,5 @@ export interface AuditEntry {
 }
 
 export type JobSubmitPayload =
-  | { mode: "pdf"; file: File }
-  | { mode: "arxiv"; arxivId: string };
+  | { mode: "pdf"; file: File; dataset?: File }
+  | { mode: "arxiv"; arxivId: string; dataset?: File };

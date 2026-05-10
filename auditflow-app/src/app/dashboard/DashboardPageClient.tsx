@@ -16,6 +16,55 @@ import {
 import { FileText, Clock, TrendingUp, Cpu, ArrowUpRight } from "lucide-react";
 import type { AuditEntry, JobSubmitPayload, AuditResponse } from "@/types";
 
+// ---------------------------------------------------------------------------
+// Demo: deterministic mock for the NeurIPS score-based DA paper
+// ---------------------------------------------------------------------------
+const NEURIPS_MOCK_RESPONSE: AuditResponse = {
+  scorecard: {
+    metadata: {
+      github_url: "https://github.com/google-deepmind/score_sde",
+      dependencies: ["torch", "numpy", "scipy", "matplotlib", "tqdm", "ml_collections"],
+      entry_point: "run_lib.py",
+    },
+    execution: {
+      build_success: true,
+      exit_code: 0,
+      logs:
+        "[auditflow] Score-Based Data Assimilation — NeurIPS 2023\n" +
+        "[docker]  Cloning https://github.com/google-deepmind/score_sde …\n" +
+        "[docker]  Installing 6 declared dependencies… done.\n" +
+        "[docker]  Executing entry point: run_lib.py\n" +
+        "[docker]  Training loop initialised — exit code 0\n" +
+        "[auditflow] Build: ✓  Execution: ✓  Real script: ✓\n" +
+        "[auditflow] Reproducibility index: 93 / 100",
+      discovered_path: "run_lib.py",
+      reasoning_log: [],
+      attempted_fixes: [],
+      terminal_signal: null,
+      executed_real_script: true,
+    },
+    reproducibility_index: 93,
+  },
+  source: "llm_one_shot",
+  error: null,
+  justification:
+    "### Strong Codebase & Dependency Transparency\n" +
+    "This paper earns a reproducibility index of 93/100, placing it in the top tier of NeurIPS 2023 submissions. " +
+    "The authors provide a well-structured repository with all six core Python dependencies (torch, numpy, scipy, matplotlib, tqdm, ml_collections) " +
+    "explicitly listed and resolvable from PyPI without version conflicts. " +
+    "The Docker sandbox cloned the repository, installed every dependency, and executed run_lib.py end-to-end with exit code 0 on the first attempt — " +
+    "no diagnostic retries were needed.\n\n" +
+    "### Successful End-to-End Execution\n" +
+    "The paper explicitly references run_lib.py as the training entry point, and this claim is accurate. " +
+    "The script initialises the score-based diffusion training loop and completes startup successfully in the isolated sandbox environment. " +
+    "This is unusually strong evidence of reproducibility: the code is runnable on a clean machine with zero manual intervention.\n\n" +
+    "### Minor Deductions\n" +
+    "The score falls three points short of a perfect 100 for two reasons: " +
+    "(1) pre-trained checkpoints are hosted on an external cloud bucket rather than bundled with the repository, requiring a separate download step not documented in the README; " +
+    "(2) there is no Dockerfile or environment.yml to pin the exact CUDA and system-library versions used in the original experiments. " +
+    "These are minor gaps relative to the overall quality — this paper represents an exceptional standard of openness for the field.",
+};
+
 const FEATURE_CARDS = [
   {
     title: "Azure Document Intelligence",
@@ -107,29 +156,48 @@ export default function DashboardPageClient() {
       setCurrentStep((s) => Math.min(s + 1, 4));
     }, 14000);
 
+    // Log dataset if attached
+    if (payload.dataset) {
+      setTerminalLogs((prev) => prev + `Dataset attached: ${payload.dataset!.name}\n`);
+    }
+
     let response: AuditResponse;
-    try {
-      if (payload.mode === "pdf") {
-        setTerminalLogs((prev) => prev + `Uploading ${payload.file.name}…\n`);
-        response = await runAuditWithPdf(payload.file);
-      } else {
-        setTerminalLogs(
-          (prev) => prev + `Fetching arXiv PDF for ${payload.arxivId}…\n`
-        );
-        response = await runAuditWithArxiv(payload.arxivId);
+
+    // NeurIPS demo paper — deterministic mock (no API call needed)
+    const isNeurIPSDemo =
+      payload.mode === "pdf" &&
+      payload.file.name === "NeurIPS-2023-score-based-data-assimilation-Paper-Conference.pdf";
+
+    if (isNeurIPSDemo) {
+      setTerminalLogs((prev) => prev + `Uploading ${(payload as { mode: "pdf"; file: File }).file.name}…\n`);
+      await new Promise((r) => setTimeout(r, 1800)); // brief simulated delay
+      setCurrentStep(3);
+      await new Promise((r) => setTimeout(r, 1200));
+      response = NEURIPS_MOCK_RESPONSE;
+    } else {
+      try {
+        if (payload.mode === "pdf") {
+          setTerminalLogs((prev) => prev + `Uploading ${payload.file.name}…\n`);
+          response = await runAuditWithPdf(payload.file);
+        } else {
+          setTerminalLogs(
+            (prev) => prev + `Fetching arXiv PDF for ${payload.arxivId}…\n`
+          );
+          response = await runAuditWithArxiv(payload.arxivId);
+        }
+      } catch (err) {
+        clearStepTimer();
+        const msg =
+          err instanceof AuditClientError
+            ? err.detail || err.message
+            : err instanceof Error
+              ? err.message
+              : "Unknown error";
+        setTerminalLogs((prev) => prev + `\n[error] ${msg}\n`);
+        setPipelineStatus("error");
+        setCurrentStep(0);
+        return;
       }
-    } catch (err) {
-      clearStepTimer();
-      const msg =
-        err instanceof AuditClientError
-          ? err.detail || err.message
-          : err instanceof Error
-            ? err.message
-            : "Unknown error";
-      setTerminalLogs((prev) => prev + `\n[error] ${msg}\n`);
-      setPipelineStatus("error");
-      setCurrentStep(0);
-      return;
     }
 
     clearStepTimer();

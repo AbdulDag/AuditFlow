@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useState } from "react";
 import { Menu, X } from "lucide-react";
-import { SignInButton, SignUpButton, Show, UserButton } from "@clerk/nextjs";
 
 const NAV_LINKS = [
   { href: "/", label: "Marketing" },
@@ -30,36 +29,6 @@ export default function TopNav() {
             ))}
           </div>
 
-          <div className="hidden items-center gap-2 md:flex">
-            <Show when="signed-out">
-              <SignInButton mode="modal">
-                <button
-                  type="button"
-                  className="cursor-pointer px-4 py-2 text-sm font-medium text-white/55 transition-colors hover:text-white"
-                >
-                  Sign in
-                </button>
-              </SignInButton>
-              <SignUpButton mode="modal">
-                <button
-                  type="button"
-                  className="cursor-pointer rounded-full bg-white px-5 py-2 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-                >
-                  Sign up
-                </button>
-              </SignUpButton>
-            </Show>
-            <Show when="signed-in">
-              <UserButton
-                appearance={{
-                  elements: {
-                    avatarBox: "h-8 w-8 ring-1 ring-white/10",
-                  },
-                }}
-              />
-            </Show>
-          </div>
-
           <button
             type="button"
             onClick={() => setOpen(!open)}
@@ -82,24 +51,6 @@ export default function TopNav() {
                 {label}
               </Link>
             ))}
-            <Show when="signed-out">
-              <SignInButton mode="modal">
-                <button type="button" className="text-left text-sm text-white/65">
-                  Sign in
-                </button>
-              </SignInButton>
-              <SignUpButton mode="modal">
-                <button
-                  type="button"
-                  className="rounded-full bg-white px-4 py-2 text-sm font-semibold text-black"
-                >
-                  Sign up
-                </button>
-              </SignUpButton>
-            </Show>
-            <Show when="signed-in">
-              <UserButton />
-            </Show>
           </div>
         )}
       </nav>

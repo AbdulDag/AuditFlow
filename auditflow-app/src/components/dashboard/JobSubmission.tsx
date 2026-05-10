@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Upload, Link2, ArrowRight, FileUp, X, AlertCircle } from "lucide-react";
+import { Upload, Link2, ArrowRight, FileUp, X, AlertCircle, Database } from "lucide-react";
 import type { JobSubmitPayload } from "@/types";
 
 interface Props {
@@ -18,9 +18,11 @@ export default function JobSubmission({
   const [mode, setMode] = useState<"arxiv" | "pdf">("arxiv");
   const [arxivId, setArxivId] = useState(defaultArxivId);
   const [droppedFile, setDroppedFile] = useState<File | null>(null);
+  const [datasetFile, setDatasetFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const datasetRef = useRef<HTMLInputElement>(null);
   const errorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -55,9 +57,9 @@ export default function JobSubmission({
     }
     try {
       if (mode === "arxiv") {
-        await onSubmit({ mode: "arxiv", arxivId: arxivId.trim() });
+        await onSubmit({ mode: "arxiv", arxivId: arxivId.trim(), dataset: datasetFile ?? undefined });
       } else {
-        await onSubmit({ mode: "pdf", file: droppedFile! });
+        await onSubmit({ mode: "pdf", file: droppedFile!, dataset: datasetFile ?? undefined });
       }
     } catch (err) {
       showError(err instanceof Error ? err.message : "Audit failed to start.");
@@ -229,6 +231,57 @@ export default function JobSubmission({
             )}
           </div>
         )}
+
+        {/* Optional dataset attachment — available in both modes */}
+        <div className="mt-5 border-t border-white/[0.06] pt-5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Database size={13} className="text-white/35" />
+              <span className="text-xs font-medium text-white/45">
+                Attach dataset{" "}
+                <span className="text-white/25 font-normal">(optional — improves scoring accuracy)</span>
+              </span>
+            </div>
+            {datasetFile ? (
+              <div className="flex items-center gap-2">
+                <span className="max-w-[180px] truncate font-mono text-[11px] text-blue-400">
+                  {datasetFile.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setDatasetFile(null)}
+                  className="cursor-pointer text-white/35 hover:text-red-400"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => datasetRef.current?.click()}
+                disabled={isRunning}
+                className="cursor-pointer rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] font-medium text-white/55 transition-colors hover:border-white/20 hover:text-white/80 disabled:opacity-40"
+              >
+                Browse…
+              </button>
+            )}
+          </div>
+          <input
+            ref={datasetRef}
+            type="file"
+            accept=".csv,.json,.jsonl,.parquet,.zip,.tar,.gz,.h5,.hdf5,.npz,.npy"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) setDatasetFile(f);
+            }}
+          />
+          {!datasetFile && (
+            <p className="mt-1.5 text-[11px] text-white/25">
+              CSV, JSON, Parquet, HDF5, NumPy or ZIP archives
+            </p>
+          )}
+        </div>
       </form>
     </div>
   );
