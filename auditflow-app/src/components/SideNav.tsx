@@ -14,12 +14,14 @@ import {
   ChevronRight,
   Activity,
   LayoutList,
+  MessageSquare,
 } from "lucide-react";
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
   { href: "/dashboard/new", label: "New Audit", icon: PlusCircle },
   { href: "/dashboard/history", label: "Audit History", icon: Clock },
+  { href: "/dashboard/paper-chat", label: "Paper Chat", icon: MessageSquare },
   { href: "/dashboard/analytics", label: "Analytics", icon: Activity },
   { href: "/dashboard/settings", label: "Settings", icon: Settings },
 ];

@@ -12,6 +12,7 @@ interface AuditContextType {
   saveAudit: (audit: AuditEntry) => void;
   getAudits: () => AuditEntry[];
   getAuditById: (id: string) => AuditEntry | null;
+  deleteAudit: (id: string) => void;
 }
 
 const AuditContext = createContext<AuditContextType | null>(null);
@@ -49,8 +50,23 @@ export function AuditProvider({ children }: { children: React.ReactNode }) {
     [getAudits]
   );
 
+  const deleteAudit = useCallback(
+    (id: string) => {
+      if (!user?.id) return;
+      const key = auditsKey(user.id);
+      const existing: AuditEntry[] = JSON.parse(
+        localStorage.getItem(key) || "[]"
+      );
+      localStorage.setItem(
+        key,
+        JSON.stringify(existing.filter((a) => a.id !== id))
+      );
+    },
+    [user?.id]
+  );
+
   return (
-    <AuditContext.Provider value={{ saveAudit, getAudits, getAuditById }}>
+    <AuditContext.Provider value={{ saveAudit, getAudits, getAuditById, deleteAudit }}>
       {children}
     </AuditContext.Provider>
   );

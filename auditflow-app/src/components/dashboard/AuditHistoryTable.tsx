@@ -1,9 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
-import { ArrowUpRight, ChevronUp, ChevronDown, Search, FlaskConical } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
+import {
+  ArrowUpRight,
+  ChevronUp,
+  ChevronDown,
+  Search,
+  FlaskConical,
+  Trash2,
+  MessageSquare,
+} from "lucide-react";
 import type { AuditEntry } from "@/types";
+import { useAuditStore } from "@/context/AuditContext";
 
 type SortKey = "paper" | "date" | "rindex" | "status";
 type SortDir = "asc" | "desc";
@@ -29,22 +38,175 @@ function RIndexBadge({ value }: { value: number }) {
   );
 }
 
+/** A single swipeable row */
+function SwipeRow({
+  audit,
+  onDelete,
+}: {
+  audit: AuditEntry;
+  onDelete: (id: string) => void;
+}) {
+  const [offsetX, setOffsetX] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const startXRef = useRef<number | null>(null);
+  const DELETE_THRESHOLD = -72;
+
+  function startDrag(clientX: number) {
+    startXRef.current = clientX;
+    setIsDragging(true);
+  }
+
+  function moveDrag(clientX: number) {
+    if (startXRef.current === null) return;
+    const delta = Math.min(0, clientX - startXRef.current);
+    setOffsetX(Math.max(delta, -80));
+  }
+
+  function endDrag() {
+    setIsDragging(false);
+    startXRef.current = null;
+    if (offsetX <= DELETE_THRESHOLD) {
+      setOffsetX(-80);
+    } else {
+      setOffsetX(0);
+    }
+  }
+
+  const isOpen = offsetX <= DELETE_THRESHOLD;
+
+  return (
+    <tr
+      className="relative border-b border-white/[0.06] last:border-b-0"
+      style={{ overflow: "hidden" }}
+    >
+      {/* Delete reveal panel */}
+      <td
+        className="absolute right-0 top-0 h-full w-20 flex items-center justify-center bg-red-600"
+        style={{ zIndex: 1 }}
+      >
+        <button
+          type="button"
+          onClick={() => onDelete(audit.id)}
+          className="flex cursor-pointer flex-col items-center gap-1 text-white"
+          aria-label="Delete audit"
+        >
+          <Trash2 size={16} />
+          <span className="text-[10px] font-semibold">Delete</span>
+        </button>
+      </td>
+
+      {/* Sliding content */}
+      <td
+        colSpan={5}
+        className="p-0"
+        style={{ position: "relative", zIndex: 2 }}
+      >
+        <div
+          className={`flex w-full items-stretch transition-transform bg-black hover:bg-white/[0.03] ${
+            isDragging ? "transition-none" : "duration-200"
+          }`}
+          style={{ transform: `translateX(${offsetX}px)` }}
+          onMouseDown={(e) => startDrag(e.clientX)}
+          onMouseMove={(e) => isDragging && moveDrag(e.clientX)}
+          onMouseUp={endDrag}
+          onMouseLeave={endDrag}
+          onTouchStart={(e) => startDrag(e.touches[0].clientX)}
+          onTouchMove={(e) => isDragging && moveDrag(e.touches[0].clientX)}
+          onTouchEnd={endDrag}
+        >
+          {/* Paper */}
+          <div className="flex-1 min-w-0 px-6 py-4">
+            <p className="max-w-xs text-xs font-medium leading-tight text-white truncate">
+              {audit.paper}
+            </p>
+          </div>
+
+          {/* Date */}
+          <div className="whitespace-nowrap px-6 py-4 font-mono text-xs text-white/40 hidden sm:flex items-center">
+            {audit.date}
+          </div>
+
+          {/* R-Index */}
+          <div className="px-6 py-4 flex items-center">
+            <RIndexBadge value={audit.rindex} />
+          </div>
+
+          {/* Status */}
+          <div className="px-6 py-4 flex items-center">
+            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold ${STATUS_STYLES[audit.status]}`}>
+              {audit.status}
+            </span>
+          </div>
+
+          {/* Actions */}
+          <div className="px-6 py-4 flex items-center justify-end gap-2">
+            {/* Open in Chat */}
+            <Link
+              href={`/dashboard/paper-chat?id=${audit.id}`}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/[0.06] text-white/50 transition-colors hover:bg-white/[0.12] hover:text-white"
+              title="Open in Paper Chat"
+            >
+              <MessageSquare size={12} />
+            </Link>
+
+            {/* View scorecard */}
+            <Link
+              href={audit.response ? `/scorecard?id=${audit.id}` : "/dashboard"}
+              className={`inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors duration-150 ${
+                audit.response
+                  ? "cursor-pointer bg-white text-black hover:bg-white/90"
+                  : "cursor-not-allowed bg-white/20 text-white/30"
+              }`}
+              aria-disabled={!audit.response}
+            >
+              <ArrowUpRight size={13} className="text-current" />
+            </Link>
+
+            {/* Slide hint / delete shortcut on hover */}
+            {isOpen && (
+              <button
+                type="button"
+                onClick={() => onDelete(audit.id)}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-red-600 text-white transition-colors hover:bg-red-500"
+              >
+                <Trash2 size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 interface Props {
   audits: AuditEntry[];
 }
 
-export default function AuditHistoryTable({ audits }: Props) {
+export default function AuditHistoryTable({ audits: initialAudits }: Props) {
+  const { deleteAudit } = useAuditStore();
+  const [rows, setRows] = useState<AuditEntry[]>(initialAudits);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("date");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
+  // Keep in sync when parent passes new audits (e.g. after a new run)
+  useEffect(() => {
+    setRows(initialAudits);
+  }, [initialAudits]);
+
+  function handleDelete(id: string) {
+    deleteAudit(id);
+    setRows((prev) => prev.filter((a) => a.id !== id));
+  }
+
   function toggleSort(key: SortKey) {
-    if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
+    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     else { setSortKey(key); setSortDir("desc"); }
   }
 
-  const filtered = audits
-    .filter(a => a.paper.toLowerCase().includes(query.toLowerCase()))
+  const filtered = rows
+    .filter((a) => a.paper.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => {
       const mul = sortDir === "asc" ? 1 : -1;
       if (sortKey === "rindex") return (a.rindex - b.rindex) * mul;
@@ -54,8 +216,7 @@ export default function AuditHistoryTable({ audits }: Props) {
     });
 
   function SortIcon({ k }: { k: SortKey }) {
-    if (sortKey !== k)
-      return <ChevronUp size={12} className="text-white/15" />;
+    if (sortKey !== k) return <ChevronUp size={12} className="text-white/15" />;
     return sortDir === "asc" ? (
       <ChevronUp size={12} className="text-white" />
     ) : (
@@ -69,17 +230,14 @@ export default function AuditHistoryTable({ audits }: Props) {
         <div>
           <h2 className="text-base font-semibold text-white">Audit history</h2>
           <p className="mt-0.5 text-xs text-white/40">
-            {audits.length === 0
+            {rows.length === 0
               ? "No audits yet"
-              : `${audits.length} audit${audits.length !== 1 ? "s" : ""}`}
+              : `${rows.length} audit${rows.length !== 1 ? "s" : ""} · slide left to delete`}
           </p>
         </div>
-        {audits.length > 0 && (
+        {rows.length > 0 && (
           <div className="relative w-full sm:w-64">
-            <Search
-              size={13}
-              className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30"
-            />
+            <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" />
             <input
               type="text"
               value={query}
@@ -91,22 +249,19 @@ export default function AuditHistoryTable({ audits }: Props) {
         )}
       </div>
 
-      {/* Empty state */}
-      {audits.length === 0 && (
+      {rows.length === 0 && (
         <div className="flex flex-col items-center justify-center gap-3 px-6 py-16">
           <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04]">
             <FlaskConical size={20} className="text-white/50" />
           </div>
           <p className="text-sm font-semibold text-white">No audits yet</p>
           <p className="max-w-xs text-center text-xs leading-relaxed text-white/40">
-            Submit a PDF or arXiv ID above. Scorecards are saved per signed-in
-            account.
+            Submit a PDF or arXiv ID above. Scorecards are saved per signed-in account.
           </p>
         </div>
       )}
 
-      {/* Table */}
-      {audits.length > 0 && (
+      {rows.length > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -131,50 +286,17 @@ export default function AuditHistoryTable({ audits }: Props) {
                   </th>
                 ))}
                 <th className="px-6 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-white/35">
-                  Report
+                  Actions
                 </th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((audit, i) => (
-                <tr
+              {filtered.map((audit) => (
+                <SwipeRow
                   key={audit.id}
-                  className={`border-b border-white/[0.06] transition-colors duration-150 hover:bg-white/[0.03] ${
-                    i === filtered.length - 1 ? "border-b-0" : ""
-                  }`}
-                >
-                  <td className="px-6 py-4">
-                    <p className="max-w-xs text-xs font-medium leading-tight text-white">
-                      {audit.paper}
-                    </p>
-                  </td>
-                  <td className="whitespace-nowrap px-6 py-4 font-mono text-xs text-white/40">
-                    {audit.date}
-                  </td>
-                  <td className="px-6 py-4"><RIndexBadge value={audit.rindex} /></td>
-                  <td className="px-6 py-4">
-                    <span
-                      className={`rounded-full border px-2.5 py-1 text-[10px] font-bold ${STATUS_STYLES[audit.status]}`}
-                    >
-                      {audit.status}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 text-right">
-                    <Link
-                      href={
-                        audit.response ? `/scorecard?id=${audit.id}` : "/dashboard"
-                      }
-                      className={`inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors duration-150 ${
-                        audit.response
-                          ? "cursor-pointer bg-white text-black hover:bg-white/90"
-                          : "cursor-not-allowed bg-white/20 text-white/30"
-                      }`}
-                      aria-disabled={!audit.response}
-                    >
-                      <ArrowUpRight size={13} className="text-current" />
-                    </Link>
-                  </td>
-                </tr>
+                  audit={audit}
+                  onDelete={handleDelete}
+                />
               ))}
             </tbody>
           </table>
