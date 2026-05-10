@@ -38,7 +38,9 @@ function RIndexBadge({ value }: { value: number }) {
   );
 }
 
-/** A single swipeable row */
+const DELETE_THRESHOLD = -80;
+
+/** A single swipeable row — drag left past threshold to delete instantly */
 function SwipeRow({
   audit,
   onDelete,
@@ -48,10 +50,11 @@ function SwipeRow({
 }) {
   const [offsetX, setOffsetX] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const startXRef = useRef<number | null>(null);
-  const DELETE_THRESHOLD = -72;
 
   function startDrag(clientX: number) {
+    if (deleting) return;
     startXRef.current = clientX;
     setIsDragging(true);
   }
@@ -59,62 +62,66 @@ function SwipeRow({
   function moveDrag(clientX: number) {
     if (startXRef.current === null) return;
     const delta = Math.min(0, clientX - startXRef.current);
-    setOffsetX(Math.max(delta, -80));
+    setOffsetX(Math.max(delta, -window.innerWidth));
   }
 
   function endDrag() {
     setIsDragging(false);
     startXRef.current = null;
     if (offsetX <= DELETE_THRESHOLD) {
-      setOffsetX(-80);
+      // Animate off-screen then delete
+      setDeleting(true);
+      setOffsetX(-window.innerWidth);
+      setTimeout(() => onDelete(audit.id), 220);
     } else {
       setOffsetX(0);
     }
   }
 
-  const isOpen = offsetX <= DELETE_THRESHOLD;
+  // How far through the delete zone we are (0→1)
+  const progress = Math.min(1, Math.abs(offsetX) / Math.abs(DELETE_THRESHOLD));
+  const showingDelete = offsetX < -15;
 
   return (
     <tr
-      className="relative border-b border-white/[0.06] last:border-b-0"
-      style={{ overflow: "hidden" }}
+      className="relative border-b border-white/[0.06] last:border-b-0 overflow-hidden"
+      style={{ height: deleting ? 0 : undefined, transition: deleting ? "height 0.2s" : undefined }}
     >
-      {/* Delete reveal panel */}
+      {/* Red delete background — grows as you drag */}
       <td
-        className="absolute right-0 top-0 h-full w-20 flex items-center justify-center bg-red-600"
-        style={{ zIndex: 1 }}
+        className="absolute inset-0 flex items-center justify-end pr-5"
+        style={{
+          background: `rgba(220,38,38,${Math.min(0.9, progress * 1.2)})`,
+          zIndex: 1,
+          pointerEvents: "none",
+        }}
       >
-        <button
-          type="button"
-          onClick={() => onDelete(audit.id)}
-          className="flex cursor-pointer flex-col items-center gap-1 text-white"
-          aria-label="Delete audit"
-        >
-          <Trash2 size={16} />
-          <span className="text-[10px] font-semibold">Delete</span>
-        </button>
+        {showingDelete && (
+          <div className="flex flex-col items-center gap-0.5 text-white/90">
+            <Trash2 size={16} />
+            <span className="text-[9px] font-bold uppercase tracking-wider">Delete</span>
+          </div>
+        )}
       </td>
 
-      {/* Sliding content */}
-      <td
-        colSpan={5}
-        className="p-0"
-        style={{ position: "relative", zIndex: 2 }}
-      >
+      {/* Sliding row content */}
+      <td colSpan={5} className="p-0" style={{ position: "relative", zIndex: 2 }}>
         <div
-          className={`flex w-full items-stretch transition-transform bg-black hover:bg-white/[0.03] ${
-            isDragging ? "transition-none" : "duration-200"
-          }`}
-          style={{ transform: `translateX(${offsetX}px)` }}
+          className="flex w-full items-stretch bg-[#111] select-none"
+          style={{
+            transform: `translateX(${offsetX}px)`,
+            transition: isDragging || deleting ? (deleting ? "transform 0.22s ease-in" : "none") : "transform 0.2s ease-out",
+            cursor: isDragging ? "grabbing" : "grab",
+          }}
           onMouseDown={(e) => startDrag(e.clientX)}
           onMouseMove={(e) => isDragging && moveDrag(e.clientX)}
           onMouseUp={endDrag}
           onMouseLeave={endDrag}
           onTouchStart={(e) => startDrag(e.touches[0].clientX)}
-          onTouchMove={(e) => isDragging && moveDrag(e.touches[0].clientX)}
+          onTouchMove={(e) => { e.preventDefault(); isDragging && moveDrag(e.touches[0].clientX); }}
           onTouchEnd={endDrag}
         >
-          {/* Paper */}
+          {/* Paper name */}
           <div className="flex-1 min-w-0 px-6 py-4">
             <p className="max-w-xs text-xs font-medium leading-tight text-white truncate">
               {audit.paper}
@@ -138,20 +145,22 @@ function SwipeRow({
             </span>
           </div>
 
-          {/* Actions */}
-          <div className="px-6 py-4 flex items-center justify-end gap-2">
-            {/* Open in Chat */}
+          {/* Actions — hidden while dragging so they don't overlap the red bg */}
+          <div
+            className="px-6 py-4 flex items-center justify-end gap-2 transition-opacity duration-100"
+            style={{ opacity: showingDelete ? 0 : 1, pointerEvents: showingDelete ? "none" : "auto" }}
+          >
             <Link
               href={`/dashboard/paper-chat?id=${audit.id}`}
+              onClick={(e) => isDragging && e.preventDefault()}
               className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/[0.06] text-white/50 transition-colors hover:bg-white/[0.12] hover:text-white"
               title="Open in Paper Chat"
             >
               <MessageSquare size={12} />
             </Link>
-
-            {/* View scorecard */}
             <Link
               href={audit.response ? `/scorecard?id=${audit.id}` : "/dashboard"}
+              onClick={(e) => isDragging && e.preventDefault()}
               className={`inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors duration-150 ${
                 audit.response
                   ? "cursor-pointer bg-white text-black hover:bg-white/90"
@@ -161,17 +170,6 @@ function SwipeRow({
             >
               <ArrowUpRight size={13} className="text-current" />
             </Link>
-
-            {/* Slide hint / delete shortcut on hover */}
-            {isOpen && (
-              <button
-                type="button"
-                onClick={() => onDelete(audit.id)}
-                className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-red-600 text-white transition-colors hover:bg-red-500"
-              >
-                <Trash2 size={12} />
-              </button>
-            )}
           </div>
         </div>
       </td>

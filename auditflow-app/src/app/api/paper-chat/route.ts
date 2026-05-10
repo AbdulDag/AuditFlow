@@ -15,36 +15,55 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let body: { messages: { role: string; content: string }[]; highlight?: string };
+  let body: {
+    messages: { role: string; content: string }[];
+    highlight?: string;
+    documentContext?: string;
+  };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const { messages, highlight } = body;
+  const { messages, highlight, documentContext } = body;
   if (!Array.isArray(messages)) {
     return NextResponse.json({ error: "messages array required." }, { status: 400 });
   }
 
-  // Build system prompt — if there's a highlighted selection, add context
-  const systemPrompt =
-    "You are a helpful research assistant. The user is reading a scientific paper. " +
-    "Answer questions concisely and accurately. If a text selection is provided, use it as context. " +
-    "Format responses in plain prose — no excessive markdown.";
-
-  const fullMessages: { role: string; content: string }[] = [
-    { role: "system", content: systemPrompt },
-    ...(highlight
-      ? [
-          {
-            role: "system",
-            content: `The user has highlighted this passage from the paper:\n\n"${highlight}"`,
-          },
-        ]
-      : []),
-    ...messages,
+  const systemMessages: { role: string; content: string }[] = [
+    {
+      role: "system",
+      content:
+        "You are a helpful AI research assistant. The user is reading a scientific paper. " +
+        "Answer questions concisely and accurately. " +
+        "You have access to the full document content including tables, figures, and equations " +
+        "extracted by Azure Document Intelligence. " +
+        "When referencing figures or tables, describe what they show. " +
+        "Format responses in clear prose — avoid excessive markdown symbols.",
+    },
   ];
+
+  // Inject the full document context (Azure DI Markdown output)
+  if (documentContext) {
+    systemMessages.push({
+      role: "system",
+      content:
+        "Below is the full paper content extracted by Azure Document Intelligence " +
+        "(including text, tables, figure captions, and equations):\n\n" +
+        documentContext,
+    });
+  }
+
+  // Add highlighted text as additional context
+  if (highlight) {
+    systemMessages.push({
+      role: "system",
+      content: `The user has highlighted this passage:\n\n"${highlight}"`,
+    });
+  }
+
+  const fullMessages = [...systemMessages, ...messages];
 
   const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
 
