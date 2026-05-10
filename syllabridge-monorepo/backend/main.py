@@ -503,7 +503,7 @@ async def audit(file: UploadFile = File(...)) -> AuditResponse:
             )
 
         # --- 4. Docker sandbox audit -----------------------------------------
-        _AUDIT_TIMEOUT_SECONDS = 300  # 5 minutes total (build + run)
+        _AUDIT_TIMEOUT_SECONDS = 900  # 15 minutes total (build + run)
         try:
             audit_result = await asyncio.wait_for(
                 asyncio.to_thread(_auditor.run_audit, metadata, markdown_content),

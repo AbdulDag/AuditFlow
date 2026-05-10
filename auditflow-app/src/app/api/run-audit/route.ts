@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { Agent, fetch as undiciFetch, FormData as UndiciFormData } from "undici";
 
 export const runtime = "nodejs";
+export const maxDuration = 900; // 15 minutes — matches backend audit timeout
 
 const MAX_BYTES = 100 * 1024 * 1024;
 
