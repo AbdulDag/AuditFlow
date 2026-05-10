@@ -1,8 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Agent, fetch as undiciFetch, FormData as UndiciFormData } from "undici";
 
 export const runtime = "nodejs";
 
 const MAX_BYTES = 100 * 1024 * 1024;
+
+// Node.js built-in fetch (undici) has a hard 5-minute headersTimeout that
+// kills long-running audit requests before the Python server can respond.
+// A custom Agent overrides that default for this route only.
+const _auditAgent = new Agent({
+  headersTimeout: 15 * 60 * 1000, // 15 minutes
+  bodyTimeout: 15 * 60 * 1000,
+});
 
 function backendBase(): string {
   const u =
@@ -57,7 +66,7 @@ export async function POST(req: NextRequest) {
       );
     }
     const pdfUrl = `https://arxiv.org/pdf/${id}.pdf`;
-    const pdfRes = await fetch(pdfUrl, { redirect: "follow" });
+    const pdfRes = await undiciFetch(pdfUrl, { redirect: "follow" }) as unknown as Response;
     if (!pdfRes.ok) {
       return NextResponse.json(
         {
@@ -85,15 +94,17 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ detail: "File exceeds 100 MB" }, { status: 413 });
   }
 
-  const fd = new FormData();
-  fd.append("file", file);
+  const fileBytes = await file.arrayBuffer();
+  const fd = new UndiciFormData();
+  fd.append("file", new Blob([fileBytes], { type: file.type }), file.name);
 
   let auditRes: Response;
   try {
-    auditRes = await fetch(`${backendBase()}/api/audit`, {
+    auditRes = await undiciFetch(`${backendBase()}/api/audit`, {
       method: "POST",
       body: fd,
-    });
+      dispatcher: _auditAgent,
+    }) as unknown as Response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return NextResponse.json(

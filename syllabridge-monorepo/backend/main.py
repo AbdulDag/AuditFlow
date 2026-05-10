@@ -142,13 +142,11 @@ _DEFAULT_ORIGINS = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(dict.fromkeys(_DEFAULT_ORIGINS + _parse_cors_origins())),
-    allow_origin_regex=r"chrome-extension://.*",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # ---------------------------------------------------------------------------
@@ -443,145 +441,137 @@ async def audit(file: UploadFile = File(...)) -> AuditResponse:
     with a 0-100 ``reproducibility_index``.
     """
 
-    # --- Credential guards ---------------------------------------------------
-    if not AZURE_DI_ENDPOINT or not AZURE_DI_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Azure Document Intelligence credentials not configured.",
-        )
-    if not AZURE_OAI_ENDPOINT or not AZURE_OAI_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Azure OpenAI credentials not configured.",
-        )
-
-    # --- 1. Read & validate upload ------------------------------------------
-    document_bytes = await file.read()
-    if not document_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(document_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({len(document_bytes):,} bytes; max 100 MB).",
-        )
-    if not document_bytes.startswith(b"%PDF-"):
-        raise HTTPException(
-            status_code=422,
-            detail=f"Not a PDF (first bytes: {document_bytes[:8]!r}).",
-        )
-
-    # --- 2. Azure Document Intelligence → Markdown --------------------------
     try:
-        markdown_content = _analyze_document_as_markdown(document_bytes)
-    except HttpResponseError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Azure Document Intelligence error: {exc.message}",
-        ) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Azure OCR failed: {exc}") from exc
+        # --- Credential guards -----------------------------------------------
+        if not AZURE_DI_ENDPOINT or not AZURE_DI_KEY:
+            raise HTTPException(
+                status_code=500,
+                detail="Azure Document Intelligence credentials not configured.",
+            )
+        if not AZURE_OAI_ENDPOINT or not AZURE_OAI_KEY:
+            raise HTTPException(
+                status_code=500,
+                detail="Azure OpenAI credentials not configured.",
+            )
 
-    logger.info("Azure returned %d chars of Markdown.", len(markdown_content))
+        # --- 1. Read & validate upload ---------------------------------------
+        document_bytes = await file.read()
+        if not document_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        if len(document_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({len(document_bytes):,} bytes; max 100 MB).",
+            )
+        if not document_bytes.startswith(b"%PDF-"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Not a PDF (first bytes: {document_bytes[:8]!r}).",
+            )
 
-    # --- 3. LLM extraction --------------------------------------------------
-    metadata = _llm_extract_metadata(markdown_content)
-    source = "llm_one_shot" if metadata is not None else "none"
-
-    if metadata is None:
-        # We still return a structured scorecard so the UI can render
-        # something useful — just one with a zero reproducibility index.
-        empty_metadata = PaperMetadata()
-        empty_execution = DockerExecutionResult(
-            build_success=False,
-            exit_code=-1,
-            logs="[auditflow] could not extract paper metadata from the PDF.",
-        )
-        return AuditResponse(
-            scorecard=ReproducibilityScorecard(
-                metadata=empty_metadata,
-                execution=empty_execution,
-            ),
-            source=source,
-            error="Failed to extract reproducibility metadata from the paper.",
-        )
-
-    # --- 4. Docker sandbox audit -------------------------------------------
-    # run_audit is synchronous (Docker SDK uses blocking I/O). Running it
-    # directly in an async handler would freeze the entire event loop for the
-    # duration of the build + run — potentially 10+ minutes. asyncio.to_thread
-    # offloads it to a worker thread so FastAPI stays responsive. The outer
-    # wait_for enforces a hard 5-minute wall-clock ceiling so a runaway build
-    # can never permanently hang the server.
-    _AUDIT_TIMEOUT_SECONDS = 300  # 5 minutes total (build + run)
-    try:
-        audit_result = await asyncio.wait_for(
-            asyncio.to_thread(_auditor.run_audit, metadata, markdown_content),
-            timeout=_AUDIT_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("Docker audit timed out after %ds.", _AUDIT_TIMEOUT_SECONDS)
-        audit_result = {
-            "build_success": False,
-            "exit_code": -1,
-            "logs": (
-                f"[auditflow] audit timed out after {_AUDIT_TIMEOUT_SECONDS}s. "
-                "The repository may require a very long build or the Docker daemon "
-                "is unavailable. Try a smaller paper or check Docker Desktop."
-            ),
-            "discovered_path": None,
-            "reasoning_log": [],
-            "attempted_fixes": [],
-            "terminal_signal": None,
-            "executed_real_script": False,
-        }
-
-    try:
-        execution = DockerExecutionResult(**audit_result)
-    except ValidationError as exc:
-        # Defensive: if the auditor ever returns a malformed dict, surface
-        # it as a 502 instead of letting Pydantic crash inside the response.
-        logger.error("DockerAuditor returned an invalid payload: %s", exc)
-        raise HTTPException(
-            status_code=502,
-            detail="DockerAuditor returned a malformed result.",
-        ) from exc
-
-    scorecard = ReproducibilityScorecard(metadata=metadata, execution=execution)
-
-    # --- 5. Generate "Why this score?" justification ----------------------
-    # Runs as a separate GPT-4o call after the audit so it can synthesise
-    # the final score, the raw logs, and the agent's reasoning into a
-    # 3-paragraph Markdown explanation for the researcher.  Skipped when
-    # no Azure OpenAI agent is configured (credentials missing or Docker
-    # was unavailable at startup).
-    justification: str | None = None
-    if _agent is not None:
+        # --- 2. Azure Document Intelligence → Markdown -----------------------
         try:
-            justification = await asyncio.to_thread(
-                _agent.generate_justification,
-                reproducibility_index=scorecard.reproducibility_index,
-                logs=execution.logs,
-                metadata_claims={
-                    "github_url": metadata.github_url,
-                    "dependencies": metadata.dependencies,
-                    "entry_point": metadata.entry_point,
-                },
-                reasoning_log=execution.reasoning_log,
-                attempted_fixes=execution.attempted_fixes,
-                terminal_signal=execution.terminal_signal,
+            markdown_content = _analyze_document_as_markdown(document_bytes)
+        except HttpResponseError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Azure Document Intelligence error: {exc.message}",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Azure OCR failed: {exc}") from exc
+
+        logger.info("Azure returned %d chars of Markdown.", len(markdown_content))
+
+        # --- 3. LLM extraction -----------------------------------------------
+        metadata = _llm_extract_metadata(markdown_content)
+        source = "llm_one_shot" if metadata is not None else "none"
+
+        if metadata is None:
+            empty_metadata = PaperMetadata()
+            empty_execution = DockerExecutionResult(
+                build_success=False,
+                exit_code=-1,
+                logs="[auditflow] could not extract paper metadata from the PDF.",
             )
-        except Exception as _just_exc:  # noqa: BLE001
-            logger.warning(
-                "generate_justification raised unexpectedly: %s", _just_exc
+            return AuditResponse(
+                scorecard=ReproducibilityScorecard(
+                    metadata=empty_metadata,
+                    execution=empty_execution,
+                ),
+                source=source,
+                error="Failed to extract reproducibility metadata from the paper.",
             )
 
-    return AuditResponse(
-        scorecard=scorecard,
-        source=source,
-        error=None if execution.build_success else
-              "Docker build failed — see logs for details.",
-        justification=justification,
-    )
+        # --- 4. Docker sandbox audit -----------------------------------------
+        _AUDIT_TIMEOUT_SECONDS = 300  # 5 minutes total (build + run)
+        try:
+            audit_result = await asyncio.wait_for(
+                asyncio.to_thread(_auditor.run_audit, metadata, markdown_content),
+                timeout=_AUDIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Docker audit timed out after %ds.", _AUDIT_TIMEOUT_SECONDS)
+            audit_result = {
+                "build_success": False,
+                "exit_code": -1,
+                "logs": (
+                    f"[auditflow] audit timed out after {_AUDIT_TIMEOUT_SECONDS}s. "
+                    "The repository may require a very long build or the Docker daemon "
+                    "is unavailable. Try a smaller paper or check Docker Desktop."
+                ),
+                "discovered_path": None,
+                "reasoning_log": [],
+                "attempted_fixes": [],
+                "terminal_signal": None,
+                "executed_real_script": False,
+            }
+
+        try:
+            execution = DockerExecutionResult(**audit_result)
+        except ValidationError as exc:
+            logger.error("DockerAuditor returned an invalid payload: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail="DockerAuditor returned a malformed result.",
+            ) from exc
+
+        scorecard = ReproducibilityScorecard(metadata=metadata, execution=execution)
+
+        # --- 5. Generate "Why this score?" justification ---------------------
+        justification: str | None = None
+        if _agent is not None:
+            try:
+                justification = await asyncio.to_thread(
+                    _agent.generate_justification,
+                    reproducibility_index=scorecard.reproducibility_index,
+                    logs=execution.logs,
+                    metadata_claims={
+                        "github_url": metadata.github_url,
+                        "dependencies": metadata.dependencies,
+                        "entry_point": metadata.entry_point,
+                    },
+                    reasoning_log=execution.reasoning_log,
+                    attempted_fixes=execution.attempted_fixes,
+                    terminal_signal=execution.terminal_signal,
+                )
+            except Exception as _just_exc:  # noqa: BLE001
+                logger.warning(
+                    "generate_justification raised unexpectedly: %s", _just_exc
+                )
+
+        return AuditResponse(
+            scorecard=scorecard,
+            source=source,
+            error=None if execution.build_success else
+                  "Docker build failed — see logs for details.",
+            justification=justification,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled exception in /api/audit: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -603,4 +593,4 @@ async def health() -> dict[str, str]:
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
