@@ -15,7 +15,7 @@ contract, the sandbox service, and the frontend in sync.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -91,10 +91,30 @@ class DockerExecutionResult(BaseModel):
         viewer.
     discovered_path:
         Repo-relative path of the entry-point script located by the
-        self-healing file-discovery pass (e.g. ``"src/train.py"``).
-        ``None`` when the initial run succeeded without healing, or when
-        healing fell back to DI-Markdown re-parsing without a confirmed
-        on-disk path.
+        diagnostic agent's filesystem inspection (e.g. ``"src/train.py"``).
+        ``None`` when the initial run succeeded without intervention.
+    reasoning_log:
+        Ordered list of ``ReasoningStep`` dicts produced by the
+        :class:`~services.diagnostic_agent.DiagnosticAgent` during its
+        Observe -> Think -> Act -> Observe loop.  Each entry carries
+        ``iteration``, ``phase``, ``tool``, ``summary`` and an optional
+        ``detail`` field so the React client can render the agent's
+        full chain of thought in a collapsible "Diagnostic Trace" panel.
+        Empty list when no agent was triggered (initial run succeeded
+        or no Azure OpenAI credentials were configured).
+    attempted_fixes:
+        Ordered list of ``Hypothesis`` dicts - one per
+        ``modify_infrastructure`` call the agent issued.  Each entry
+        carries ``iteration``, ``category`` (``pip_package``,
+        ``apt_package``, ``pythonpath``, ...), ``description``,
+        ``rebuild_succeeded``, ``exit_code`` and a one-line
+        ``summary``.  Useful for explaining *what* the agent tried,
+        complementing ``reasoning_log`` which explains *why*.
+    terminal_signal:
+        How the diagnostic loop ended: ``"submit_final_audit"`` (clean
+        success), ``"cannot_fix"`` (agent gave up), ``"max_iterations"``,
+        ``"max_rebuilds"``, or ``"agent_error"``.  ``None`` when no
+        agent was triggered.
     """
 
     build_success: bool = Field(..., description="Did `docker build` succeed?")
@@ -103,8 +123,31 @@ class DockerExecutionResult(BaseModel):
     discovered_path: Optional[str] = Field(
         None,
         description=(
-            "Repo-relative path found by self-healing file discovery, "
-            "e.g. 'src/train.py'. Null when no healing was needed."
+            "Repo-relative path found by the diagnostic agent's filesystem "
+            "inspection, e.g. 'src/train.py'. Null when no intervention "
+            "was needed."
+        ),
+    )
+    reasoning_log: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Structured Observe -> Think -> Act -> Observe trace from the "
+            "DiagnosticAgent.  Empty when no agent was triggered."
+        ),
+    )
+    attempted_fixes: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "List of Hypothesis dicts - one per modify_infrastructure "
+            "call the agent issued.  Empty when no agent was triggered."
+        ),
+    )
+    terminal_signal: Optional[str] = Field(
+        None,
+        description=(
+            "How the diagnostic loop ended ('submit_final_audit', "
+            "'cannot_fix', 'max_iterations', 'max_rebuilds', 'agent_error') "
+            "or null when the agent was not invoked."
         ),
     )
 

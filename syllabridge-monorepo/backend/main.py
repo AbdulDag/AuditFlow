@@ -46,7 +46,7 @@ from models.scorecard import (
     PaperMetadata,
     ReproducibilityScorecard,
 )
-from services.healer import SelfHealingLoop
+from services.diagnostic_agent import DiagnosticAgent
 from services.sandbox import DockerAuditor
 
 logging.basicConfig(level=logging.INFO)
@@ -92,27 +92,31 @@ else:
     logger.warning("AZURE_OPENAI_* not set — LLM extraction disabled.")
 
 # Single shared sandbox; the DockerAuditor itself is stateless.
-# When Azure OpenAI credentials are present we also attach the GPT-4o
-# Self-Healing Loop so the auditor can autonomously diagnose and repair
-# Docker build / run failures before returning a FAIL result.
-_healer: SelfHealingLoop | None = None
+# When Azure OpenAI credentials are present we also attach the
+# DiagnosticAgent so the auditor can autonomously diagnose and repair
+# Docker build/run failures via its recursive Observe -> Think -> Act
+# loop before returning a FAIL result.  Without an agent the auditor
+# returns failures verbatim (no hard-coded heuristic recovery).
+_agent: DiagnosticAgent | None = None
 if _oai_client is not None:
     try:
-        _docker_client_for_healer = docker.from_env()
-        _healer = SelfHealingLoop(
+        _docker_client_for_agent = docker.from_env()
+        _agent = DiagnosticAgent(
             oai_client=_oai_client,
             deployment=AZURE_OAI_DEPLOY,
-            docker_client=_docker_client_for_healer,
+            docker_client=_docker_client_for_agent,
             base_image="python:3.10-slim",
         )
-        logger.info("GPT-4o Self-Healing Loop initialised (deployment=%s).", AZURE_OAI_DEPLOY)
-    except Exception as _healer_exc:  # noqa: BLE001
+        logger.info(
+            "DiagnosticAgent initialised (deployment=%s).", AZURE_OAI_DEPLOY,
+        )
+    except Exception as _agent_exc:  # noqa: BLE001
         logger.warning(
-            "Could not initialise Self-Healing Loop (Docker unavailable?): %s",
-            _healer_exc,
+            "Could not initialise DiagnosticAgent (Docker unavailable?): %s",
+            _agent_exc,
         )
 
-_auditor = DockerAuditor(healer=_healer)
+_auditor = DockerAuditor(agent=_agent)
 
 # ---------------------------------------------------------------------------
 # FastAPI app

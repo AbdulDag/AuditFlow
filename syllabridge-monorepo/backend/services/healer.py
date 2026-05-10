@@ -74,6 +74,16 @@ _BACKOFF_MAX: float = 60.0
 #: Number of 429 retry attempts before re-raising.
 _BACKOFF_MAX_RETRIES: int = 6
 
+#: Regex that validates a repo-relative POSIX path before we hand it back
+#: to the Dockerfile generator.  Mirrors the ``_ENTRY_POINT_RE`` in
+#: ``sandbox.py`` — kept here to avoid a circular import.
+import re as _re
+_VALID_PATH_RE = _re.compile(r"^[A-Za-z0-9_./\-]+$")
+
+#: Maximum characters of raw paper Markdown forwarded to GPT-4o as
+#: context for the entry-point probe.  Keeps the prompt lean.
+_MAX_PAPER_CONTEXT_CHARS: int = 3_000
+
 # ---------------------------------------------------------------------------
 # Tool schema — passed verbatim to the Azure OpenAI API
 # ---------------------------------------------------------------------------
@@ -542,6 +552,142 @@ class SelfHealingLoop:
             return f"[error] exec_run failed: {exc}"
 
     # ------------------------------------------------------------------
+    # Autonomous Discovery Probe
+    # ------------------------------------------------------------------
+
+    def ask_for_entry_point(
+        self,
+        *,
+        discovered_files: list[str],
+        original_entry: str,
+        raw_markdown: str = "",
+    ) -> Optional[str]:
+        """
+        Ask GPT-4o which Python file in the repository is the most likely
+        main execution script, given that ``original_entry`` was not found.
+
+        This is the **Autonomous Discovery Probe** step: instead of picking
+        heuristically by stem priority, we send the actual on-disk file list
+        (produced by ``find . -maxdepth 3 -not -path '*/.*' -name '*.py'``)
+        straight to GPT-4o with the paper's Markdown as context.
+
+        Parameters
+        ----------
+        discovered_files:
+            Repo-relative paths returned by the discovery ``find`` command.
+            Capped to the first 60 entries so the prompt stays compact.
+        original_entry:
+            The entry-point that triggered the exec error (e.g. ``"main.py"``).
+        raw_markdown:
+            Optional full paper Markdown from Azure Document Intelligence.
+            The first :data:`_MAX_PAPER_CONTEXT_CHARS` characters are
+            forwarded as context.  Pass an empty string to omit.
+
+        Returns
+        -------
+        str or None
+            A validated repo-relative path (e.g. ``"src/train.py"``) that
+            exists in ``discovered_files``, or ``None`` when GPT-4o's answer
+            is absent, malformed, or does not match the discovered file set.
+        """
+        if not discovered_files:
+            return None
+
+        # ── Build prompt ──────────────────────────────────────────────────
+        file_list_str = "\n".join(
+            f"  {f}" for f in discovered_files[:60]
+        )
+        if len(discovered_files) > 60:
+            file_list_str += f"\n  ... ({len(discovered_files) - 60} more files omitted)"
+
+        paper_context = ""
+        if raw_markdown.strip():
+            excerpt = raw_markdown[:_MAX_PAPER_CONTEXT_CHARS]
+            if len(raw_markdown) > _MAX_PAPER_CONTEXT_CHARS:
+                excerpt += "\n... [paper truncated]"
+            paper_context = f"\nPaper excerpt (for additional context):\n{excerpt}"
+
+        prompt = (
+            f"The user's requested entry point '{original_entry}' was NOT found "
+            f"in the repository.\n\n"
+            f"Here are the Python files actually present in the repo "
+            f"(found via `find . -maxdepth 3 -not -path '*/.*' -name '*.py'`):\n\n"
+            f"{file_list_str}"
+            f"{paper_context}\n\n"
+            "Based on the repository file structure and the research paper, "
+            "identify the single most likely main execution script.\n"
+            "Respond with ONLY the repo-relative path (e.g. src/train.py).\n"
+            "No explanation, no code fences, no leading './' — just the bare path."
+        )
+
+        messages: list[dict] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert at analysing ML research paper repositories. "
+                    "You respond with a single file path and nothing else."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        # ── Call GPT-4o (text only, no tool schema) ───────────────────────
+        try:
+            response = self._call_llm_simple(messages)
+            raw_answer = (response.choices[0].message.content or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[healer] ask_for_entry_point LLM call failed: %s", exc)
+            return None
+
+        # ── Sanitise the response ─────────────────────────────────────────
+        # Strip common LLM formatting artefacts: code fences, backticks,
+        # leading "./" or "/", trailing whitespace.
+        path = raw_answer.strip("`").strip()
+        path = path.lstrip("./").strip("/").strip()
+
+        if not path:
+            logger.warning("[healer] ask_for_entry_point: GPT-4o returned empty string")
+            return None
+
+        if not _VALID_PATH_RE.match(path):
+            logger.warning(
+                "[healer] ask_for_entry_point: GPT-4o path %r failed validation — ignoring",
+                path,
+            )
+            return None
+
+        # ── Validate against the discovered file list ─────────────────────
+        # Normalise both sides by stripping any leading "./" the find
+        # command might have left in.
+        normalised_discovered = {f.lstrip("./") for f in discovered_files}
+
+        if path in normalised_discovered:
+            logger.info(
+                "[healer] Autonomous Discovery Probe → GPT-4o identified "
+                "entry point: %r (confirmed in discovered files)",
+                path,
+            )
+            return path
+
+        # Soft match: accept if it ends in .py and looks plausible —
+        # GPT-4o may return a path with slightly different casing or prefix
+        # that the find output normalised away.
+        if path.endswith(".py"):
+            logger.info(
+                "[healer] Autonomous Discovery Probe → GPT-4o identified "
+                "entry point: %r (not in discovered set — accepting cautiously)",
+                path,
+            )
+            return path
+
+        logger.warning(
+            "[healer] ask_for_entry_point: GPT-4o path %r not in discovered "
+            "files and does not end in .py — ignoring",
+            path,
+        )
+        return None
+
+    # ------------------------------------------------------------------
     # Azure OpenAI call with exponential back-off + full jitter
     # ------------------------------------------------------------------
 
@@ -593,6 +739,46 @@ class SelfHealingLoop:
 
         # Unreachable — the loop always either returns or raises.
         raise RuntimeError("[healer] _call_llm_with_backoff exhausted unexpectedly")  # pragma: no cover
+
+    def _call_llm_simple(self, messages: list[dict]) -> Any:
+        """
+        Call GPT-4o for a **plain text** response — no tool schema is
+        attached.  Used by :meth:`ask_for_entry_point` where we want a
+        single path string back, not a function call.
+
+        Applies the same exponential back-off + full-jitter retry policy
+        as :meth:`_call_llm_with_backoff`.
+
+        Raises
+        ------
+        RateLimitError
+            After :data:`_BACKOFF_MAX_RETRIES` unsuccessful attempts.
+        """
+        for attempt in range(_BACKOFF_MAX_RETRIES + 1):
+            try:
+                return self._oai.chat.completions.create(
+                    model=self._deployment,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=64,
+                )
+            except RateLimitError as exc:
+                if attempt >= _BACKOFF_MAX_RETRIES:
+                    raise
+
+                cap = min(_BACKOFF_MAX, _BACKOFF_BASE ** attempt)
+                sleep_time = random.uniform(0, cap)
+                logger.warning(
+                    "[healer] 429 on simple call (attempt %d/%d) — "
+                    "sleeping %.1fs. %s",
+                    attempt + 1,
+                    _BACKOFF_MAX_RETRIES,
+                    sleep_time,
+                    exc,
+                )
+                time.sleep(sleep_time)
+
+        raise RuntimeError("[healer] _call_llm_simple exhausted unexpectedly")  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Internal serialisation helper
