@@ -477,7 +477,7 @@ async def audit(file: UploadFile = File(...)) -> AuditResponse:
     _AUDIT_TIMEOUT_SECONDS = 300  # 5 minutes total (build + run)
     try:
         audit_result = await asyncio.wait_for(
-            asyncio.to_thread(_auditor.run_audit, metadata),
+            asyncio.to_thread(_auditor.run_audit, metadata, markdown_content),
             timeout=_AUDIT_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:

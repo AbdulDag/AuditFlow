@@ -35,6 +35,7 @@ matching :class:`backend.models.scorecard.DockerExecutionResult`::
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 import shlex
@@ -73,6 +74,33 @@ _ENTRY_POINT_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
 #: Matches an http(s) GitHub URL.
 _GITHUB_URL_RE = re.compile(
     r"^https?://(?:www\.)?github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:\.git)?/?$"
+)
+
+# ---------------------------------------------------------------------------
+# Self-healing: exec / not-found error detection
+# ---------------------------------------------------------------------------
+
+#: Exit codes that indicate the container's shell could not exec the command.
+#: 127 = command/file not found; 126 = permission denied / not executable.
+_EXEC_ERROR_EXIT_CODES: frozenset[int] = frozenset({126, 127})
+
+#: Log patterns that indicate an exec or shell dispatcher failure even when
+#: the exit code alone is ambiguous (e.g. the container was killed externally).
+_EXEC_ERROR_LOG_RE = re.compile(
+    r"/bin/sh:|not found|No such file or directory|exec format error|cannot execute",
+    re.IGNORECASE,
+)
+
+#: Extracts a Python script name from a ``python <script.py>`` invocation —
+#: the highest-confidence source for the correct entry-point filename.
+_PY_INVOCATION_RE = re.compile(r"python\s+([\w./\-]+\.py)")
+
+#: Catches any bare ``.py`` filename appearing in the document text.
+_PY_FILENAME_RE = re.compile(r"\b([\w./\-]+\.py)\b")
+
+#: Priority order for common ML entry-point stems (lower index = higher priority).
+_ENTRY_PRIORITY_STEMS: tuple[str, ...] = (
+    "train", "run", "experiment", "eval", "demo", "infer", "inference", "main",
 )
 
 
@@ -117,7 +145,11 @@ class DockerAuditor:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_audit(self, metadata: PaperMetadata) -> dict[str, Any]:
+    def run_audit(
+        self,
+        metadata: PaperMetadata,
+        raw_markdown: str = "",
+    ) -> dict[str, Any]:
         """
         Build an image from ``metadata`` and execute its entry point.
 
@@ -125,6 +157,11 @@ class DockerAuditor:
         ----------
         metadata:
             The :class:`PaperMetadata` extracted by the LLM.
+        raw_markdown:
+            The full Markdown string returned by Azure Document Intelligence
+            for the paper.  When provided, the self-healing logic uses it to
+            re-scan for a corrected entry-point filename if the first run
+            fails with an exec / not-found error.
 
         Returns
         -------
@@ -132,6 +169,21 @@ class DockerAuditor:
             ``{"build_success": bool, "exit_code": int, "logs": str}``.
             Always populated — exceptions are caught and surfaced via
             ``logs`` so the caller can render them in the UI.
+
+        Self-healing policy
+        -------------------
+        If the container exits with a ``/bin/sh:`` or ``not found`` error
+        (exit codes 126/127, or matching log text) *and* ``raw_markdown`` was
+        supplied, the auditor:
+
+        1. Re-parses ``raw_markdown`` to locate a better entry-point filename.
+        2. Regenerates the Dockerfile with the corrected entry point.
+        3. Attempts exactly **one** rebuild + re-run.
+
+        If the retry succeeds the result reflects the healed execution.
+        If no alternative entry point can be found, or the healed build also
+        fails, ``build_success`` is set to ``False`` and the audit is flagged
+        ``FAIL``.
         """
         # 1. Validate the LLM output before letting it touch a Dockerfile.
         try:
@@ -182,10 +234,50 @@ class DockerAuditor:
         finally:
             self._safe_remove_image(client, image_tag)
 
+        all_logs = f"{build_logs}\n--- runtime ---\n{run_logs}".strip()
+
+        # 5. Self-healing: one retry if we detect a shell / exec / not-found error.
+        if raw_markdown and self._is_exec_error(exit_code, run_logs):
+            logger.warning(
+                "[self-heal] exec error detected (exit_code=%d); re-parsing DI output.",
+                exit_code,
+            )
+            new_entry = self._find_entry_point_in_markdown(raw_markdown, entry_point)
+
+            if new_entry != entry_point:
+                logger.info(
+                    "[self-heal] entry_point %r → %r; rebuilding once.",
+                    entry_point, new_entry,
+                )
+                healed_logs, healed_exit = self._attempt_healed_run(
+                    client, github_url, deps, new_entry
+                )
+                combined = f"{all_logs}\n--- self-heal ---\n{healed_logs}".strip()
+                # healed_exit == -1 means the healed build itself failed → FAIL
+                return {
+                    "build_success": healed_exit >= 0,
+                    "exit_code": healed_exit,
+                    "logs": combined,
+                }
+
+            # No distinct candidate found — flag as FAIL without a second attempt.
+            logger.warning(
+                "[self-heal] no alternative entry point found in DI output — audit FAIL."
+            )
+            return {
+                "build_success": False,
+                "exit_code": exit_code,
+                "logs": (
+                    f"{all_logs}\n"
+                    "[self-heal] exec error confirmed; no alternative entry point "
+                    "found in document — audit FAIL."
+                ),
+            }
+
         return {
             "build_success": True,
             "exit_code": exit_code,
-            "logs": f"{build_logs}\n--- runtime ---\n{run_logs}".strip(),
+            "logs": all_logs,
         }
 
     # ------------------------------------------------------------------
@@ -203,11 +295,17 @@ class DockerAuditor:
 
         The clone step always lands in ``/workspace/repo`` so subsequent
         ``WORKDIR`` and ``CMD`` instructions can rely on a fixed path.
+
+        CMD and ENTRYPOINT are serialised with ``json.dumps`` so every element
+        is always wrapped in double quotes — the only format Docker's JSON-array
+        parser accepts.  ``shlex.quote`` is intentionally NOT used for CMD
+        because it produces single-quoted tokens that trigger the ``/bin/sh:
+        not found`` error.
         """
-        # ``shlex.quote`` keeps stray quotes / spaces from breaking the
-        # shell form of CMD and from creating injection vectors.
-        quoted_url = shlex.quote(github_url)
-        quoted_entry = shlex.quote(entry_point)
+        quoted_url = shlex.quote(github_url)  # used in RUN shell form — single-quotes are fine
+
+        # entry_point was validated by _ENTRY_POINT_RE; json.dumps gives correct double-quoting.
+        cmd_instruction = json.dumps(["python", entry_point])
 
         if dependencies:
             quoted_deps = " ".join(shlex.quote(dep) for dep in dependencies)
@@ -227,7 +325,7 @@ class DockerAuditor:
             f"RUN git clone --depth 1 {quoted_url} repo\n"
             f"WORKDIR /workspace/repo\n"
             f"{pip_install}\n"
-            f'CMD ["python", {quoted_entry!s}]\n'
+            f"CMD {cmd_instruction}\n"
         )
 
     # ------------------------------------------------------------------
@@ -378,6 +476,127 @@ class DockerAuditor:
             client.images.remove(tag, force=True, noprune=False)
         except DockerException as exc:
             logger.debug("Could not remove image %s: %s", tag, exc)
+
+    # ------------------------------------------------------------------
+    # Self-healing helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_exec_error(exit_code: int, logs: str) -> bool:
+        """
+        Return ``True`` when the container failed because the shell could not
+        locate or execute the entry-point script.
+
+        Covers the two canonical failure modes:
+
+        * Exit code 127 — shell ``command not found``
+        * Exit code 126 — permission denied / not executable
+        * Log text containing ``/bin/sh:``, ``not found``, etc.
+        """
+        return (
+            exit_code in _EXEC_ERROR_EXIT_CODES
+            or bool(_EXEC_ERROR_LOG_RE.search(logs))
+        )
+
+    @staticmethod
+    def _find_entry_point_in_markdown(markdown: str, original: str) -> str:
+        """
+        Re-scan the Azure Document Intelligence Markdown for a Python entry
+        point that differs from ``original``.
+
+        Search strategy (highest confidence first):
+
+        1. Filenames that appear immediately after ``python`` in the document
+           text — e.g. ``python train.py`` or ``python src/run.py``.
+        2. All other ``.py`` filenames found anywhere in the document.
+
+        Within each tier the candidates are ranked by ``_ENTRY_PRIORITY_STEMS``
+        so ``train.py`` beats ``demo.py`` beats an arbitrary script.
+
+        Returns ``original`` unchanged when no distinct candidate is found.
+        """
+        seen: set[str] = set()
+        invocation_hits: list[str] = []
+        filename_hits: list[str] = []
+
+        def _accept(name: str) -> bool:
+            name = name.strip()
+            return bool(
+                name
+                and name not in seen
+                and _ENTRY_POINT_RE.match(name)
+                and ".." not in name
+                and not name.startswith("/")
+            )
+
+        for m in _PY_INVOCATION_RE.findall(markdown):
+            if _accept(m):
+                seen.add(m)
+                invocation_hits.append(m)
+
+        for m in _PY_FILENAME_RE.findall(markdown):
+            if _accept(m):
+                seen.add(m)
+                filename_hits.append(m)
+
+        def _priority(name: str) -> int:
+            stem = name.rsplit("/", 1)[-1].replace(".py", "").lower()
+            for i, prefix in enumerate(_ENTRY_PRIORITY_STEMS):
+                if stem.startswith(prefix):
+                    return i
+            return len(_ENTRY_PRIORITY_STEMS)
+
+        for tier in (invocation_hits, filename_hits):
+            tier.sort(key=_priority)
+            for candidate in tier:
+                if candidate != original:
+                    return candidate
+
+        return original
+
+    def _attempt_healed_run(
+        self,
+        client: "docker.DockerClient",
+        github_url: str,
+        deps: list[str],
+        new_entry: str,
+    ) -> tuple[str, int]:
+        """
+        Regenerate the Dockerfile with ``new_entry`` and execute one full
+        build-then-run cycle.
+
+        This is the single retry the self-healing policy allows before the
+        audit is flagged as ``FAIL``.
+
+        Returns
+        -------
+        (combined_logs, exit_code):
+            ``exit_code`` is ``-1`` when the healed build itself fails
+            (container never ran).  Any value ``>= 0`` means the container
+            executed — the caller decides whether the exit code is acceptable.
+        """
+        healed_tag = f"auditflow/{uuid.uuid4().hex[:12]}:latest"
+        healed_dockerfile = self._render_dockerfile(github_url, deps, new_entry)
+
+        logger.info(
+            "[self-heal] rebuilding with corrected entry_point=%r tag=%s",
+            new_entry, healed_tag,
+        )
+        logger.debug("[self-heal] healed Dockerfile:\n%s", healed_dockerfile)
+
+        build_logs, build_ok = self._build_image(client, healed_tag, healed_dockerfile)
+        if not build_ok:
+            self._safe_remove_image(client, healed_tag)
+            logger.warning("[self-heal] healed build failed — audit flagged FAIL.")
+            return build_logs, -1
+
+        try:
+            run_logs, exit_code = self._run_container(client, healed_tag)
+        finally:
+            self._safe_remove_image(client, healed_tag)
+
+        combined = f"{build_logs}\n--- runtime (healed) ---\n{run_logs}"
+        return combined, exit_code
 
     # ------------------------------------------------------------------
     # Validation
