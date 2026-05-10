@@ -42,7 +42,7 @@ import shlex
 import tarfile
 import time
 import uuid
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import docker
 from docker.errors import (
@@ -54,6 +54,9 @@ from docker.errors import (
 )
 
 from models.scorecard import PaperMetadata
+
+if TYPE_CHECKING:
+    from services.healer import SelfHealingLoop
 
 logger = logging.getLogger(__name__)
 
@@ -135,11 +138,16 @@ class DockerAuditor:
         mem_limit: str = "1g",
         run_timeout_seconds: int = 120,
         build_timeout_seconds: int = 180,
+        healer: Optional["SelfHealingLoop"] = None,
     ) -> None:
         self.base_image = base_image
         self.mem_limit = mem_limit
         self.run_timeout_seconds = run_timeout_seconds
         self.build_timeout_seconds = build_timeout_seconds
+        # Optional GPT-4o self-healing loop.  When set, the auditor
+        # triggers the ReAct diagnostic loop on build failures and
+        # non-exec runtime failures before returning a FAIL result.
+        self._healer = healer
 
     # ------------------------------------------------------------------
     # Public API
@@ -221,6 +229,24 @@ class DockerAuditor:
         # 3. Build.
         build_logs, build_ok = self._build_image(client, image_tag, dockerfile_text)
         if not build_ok:
+            # ── GPT-4o Self-Healing Loop (build failure) ──────────────────
+            # No image was produced, so the diagnostic container starts from
+            # the base image.  The healer may patch the Dockerfile and signal
+            # READY_TO_RETRY, in which case we attempt exactly one rebuild.
+            if self._healer is not None:
+                logger.info(
+                    "[sandbox] build failed — triggering GPT-4o Self-Healing Loop."
+                )
+                gpt_result = self._try_gpt_heal(
+                    client=client,
+                    error_logs=build_logs,
+                    dockerfile_text=dockerfile_text,
+                    image_tag=None,
+                )
+                if gpt_result is not None:
+                    self._safe_remove_image(client, image_tag)
+                    return gpt_result
+
             self._safe_remove_image(client, image_tag)
             return {
                 "build_success": False,
@@ -228,56 +254,70 @@ class DockerAuditor:
                 "logs": build_logs,
             }
 
-        # 4. Run.
-        try:
-            run_logs, exit_code = self._run_container(client, image_tag)
-        finally:
-            self._safe_remove_image(client, image_tag)
-
+        # 4. Run — do NOT wrap in try/finally yet; we need the image to remain
+        #    available for file-system discovery in step 5 if an exec error occurs.
+        #    _run_container itself never raises, so exit_code is always set here.
+        run_logs, exit_code = self._run_container(client, image_tag)
         all_logs = f"{build_logs}\n--- runtime ---\n{run_logs}".strip()
 
-        # 5. Self-healing: one retry if we detect a shell / exec / not-found error.
+        # 5. Self-healing: repository-aware retry on exec / not-found errors.
+        #    The original image is kept alive intentionally so that
+        #    _discover_repo_py_files can introspect the cloned repo before the
+        #    healer decides what to rebuild.
         if raw_markdown and self._is_exec_error(exit_code, run_logs):
             logger.warning(
-                "[self-heal] exec error detected (exit_code=%d); re-parsing DI output.",
+                "[self-heal] exec error detected (exit_code=%d); "
+                "starting repository-aware heal.",
                 exit_code,
             )
-            new_entry = self._find_entry_point_in_markdown(raw_markdown, entry_point)
-
-            if new_entry != entry_point:
-                logger.info(
-                    "[self-heal] entry_point %r → %r; rebuilding once.",
-                    entry_point, new_entry,
+            try:
+                return self._self_heal_with_discovery(
+                    client=client,
+                    built_image_tag=image_tag,
+                    github_url=github_url,
+                    deps=deps,
+                    original_entry=entry_point,
+                    raw_markdown=raw_markdown,
+                    prior_logs=all_logs,
                 )
-                healed_logs, healed_exit = self._attempt_healed_run(
-                    client, github_url, deps, new_entry
-                )
-                combined = f"{all_logs}\n--- self-heal ---\n{healed_logs}".strip()
-                # healed_exit == -1 means the healed build itself failed → FAIL
-                return {
-                    "build_success": healed_exit >= 0,
-                    "exit_code": healed_exit,
-                    "logs": combined,
-                }
+            finally:
+                # Always clean up the original failing image after the heal
+                # attempt, whether it succeeded or raised unexpectedly.
+                self._safe_remove_image(client, image_tag)
 
-            # No distinct candidate found — flag as FAIL without a second attempt.
-            logger.warning(
-                "[self-heal] no alternative entry point found in DI output — audit FAIL."
+        # 6. Non-exec runtime failure → GPT-4o Self-Healing Loop.
+        #    Covers: missing import, RuntimeError, wrong Python path, etc.
+        #    The built image still exists here, so the diagnostic container
+        #    can introspect the fully-cloned and pip-installed environment.
+        if exit_code != 0 and self._healer is not None:
+            logger.info(
+                "[sandbox] runtime failure (exit_code=%d) — "
+                "triggering GPT-4o Self-Healing Loop.",
+                exit_code,
             )
+            gpt_result = self._try_gpt_heal(
+                client=client,
+                error_logs=all_logs,
+                dockerfile_text=dockerfile_text,
+                image_tag=image_tag,
+            )
+            self._safe_remove_image(client, image_tag)
+            if gpt_result is not None:
+                return gpt_result
             return {
                 "build_success": False,
                 "exit_code": exit_code,
-                "logs": (
-                    f"{all_logs}\n"
-                    "[self-heal] exec error confirmed; no alternative entry point "
-                    "found in document — audit FAIL."
-                ),
+                "logs": all_logs,
+                "discovered_path": None,
             }
 
+        # No failures (or healer disabled) — normal cleanup and return.
+        self._safe_remove_image(client, image_tag)
         return {
             "build_success": True,
             "exit_code": exit_code,
             "logs": all_logs,
+            "discovered_path": None,
         }
 
     # ------------------------------------------------------------------
@@ -289,22 +329,32 @@ class DockerAuditor:
         github_url: str,
         dependencies: list[str],
         entry_point: str,
+        workdir_suffix: str = "",
     ) -> str:
         """
         Build the Dockerfile string from sanitised inputs.
 
-        The clone step always lands in ``/workspace/repo`` so subsequent
-        ``WORKDIR`` and ``CMD`` instructions can rely on a fixed path.
+        The clone step always lands in ``/workspace/repo``; if
+        ``workdir_suffix`` is provided (e.g. ``"src"``) the final
+        ``WORKDIR`` becomes ``/workspace/repo/src`` so that scripts in
+        sub-packages are found by the interpreter without path gymnastics.
 
-        CMD and ENTRYPOINT are serialised with ``json.dumps`` so every element
-        is always wrapped in double quotes — the only format Docker's JSON-array
-        parser accepts.  ``shlex.quote`` is intentionally NOT used for CMD
-        because it produces single-quoted tokens that trigger the ``/bin/sh:
-        not found`` error.
+        CMD and ENTRYPOINT are serialised with ``json.dumps`` so every
+        element is always wrapped in double quotes — the only format
+        Docker's JSON-array parser accepts.  ``shlex.quote`` is
+        intentionally NOT used for CMD because it produces single-quoted
+        tokens that trigger the ``/bin/sh: not found`` error.
         """
         quoted_url = shlex.quote(github_url)  # used in RUN shell form — single-quotes are fine
 
-        # entry_point was validated by _ENTRY_POINT_RE; json.dumps gives correct double-quoting.
+        # Derive the working directory that CMD will run inside.
+        repo_workdir = (
+            f"/workspace/repo/{workdir_suffix}".rstrip("/")
+            if workdir_suffix
+            else "/workspace/repo"
+        )
+
+        # entry_point is already validated; json.dumps gives correct double-quoting.
         cmd_instruction = json.dumps(["python", entry_point])
 
         if dependencies:
@@ -323,7 +373,7 @@ class DockerAuditor:
             f"git ca-certificates && rm -rf /var/lib/apt/lists/*\n"
             f"WORKDIR /workspace\n"
             f"RUN git clone --depth 1 {quoted_url} repo\n"
-            f"WORKDIR /workspace/repo\n"
+            f"WORKDIR {repo_workdir}\n"
             f"{pip_install}\n"
             f"CMD {cmd_instruction}\n"
         )
@@ -481,6 +531,91 @@ class DockerAuditor:
     # Self-healing helpers
     # ------------------------------------------------------------------
 
+    def _try_gpt_heal(
+        self,
+        client: "docker.DockerClient",
+        error_logs: str,
+        dockerfile_text: str,
+        image_tag: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        """
+        Delegate to the GPT-4o :class:`SelfHealingLoop` and, if it signals
+        ``READY_TO_RETRY``, perform one full rebuild + run with the patched
+        Dockerfile.
+
+        Parameters
+        ----------
+        client:
+            Active Docker SDK client.
+        error_logs:
+            Combined build / runtime logs from the failure that triggered
+            this call.
+        dockerfile_text:
+            The Dockerfile used in the failed attempt.
+        image_tag:
+            Tag of the built image, or ``None`` when the build itself
+            failed (so no image exists yet).
+
+        Returns
+        -------
+        dict or None
+            A populated ``run_audit``-style result dict on success or on a
+            healed-but-still-failing run.  ``None`` when the healer did not
+            signal ``READY_TO_RETRY`` (i.e. the caller should fall back to
+            its own failure path).
+        """
+        assert self._healer is not None  # guard — callers already check
+
+        updated_df, should_retry = self._healer.run(
+            error_logs=error_logs,
+            dockerfile_text=dockerfile_text,
+            image_tag=image_tag,
+        )
+
+        if not should_retry:
+            logger.warning(
+                "[sandbox] GPT-4o healer did not signal READY_TO_RETRY — "
+                "falling back to original failure result."
+            )
+            return None
+
+        logger.info(
+            "[sandbox] GPT-4o healer signalled READY_TO_RETRY — "
+            "rebuilding with patched Dockerfile."
+        )
+
+        healed_tag = f"auditflow/{uuid.uuid4().hex[:12]}:latest"
+        build_logs, build_ok = self._build_image(client, healed_tag, updated_df)
+
+        if not build_ok:
+            self._safe_remove_image(client, healed_tag)
+            logger.warning("[sandbox] GPT-4o healed build also failed.")
+            return {
+                "build_success": False,
+                "exit_code": -1,
+                "logs": (
+                    f"{error_logs}\n--- gpt-heal (build) ---\n{build_logs}"
+                ).strip(),
+                "discovered_path": None,
+            }
+
+        try:
+            run_logs, exit_code = self._run_container(client, healed_tag)
+        finally:
+            self._safe_remove_image(client, healed_tag)
+
+        combined = (
+            f"{error_logs}\n--- gpt-heal (build) ---\n{build_logs}"
+            f"\n--- gpt-heal (runtime) ---\n{run_logs}"
+        ).strip()
+
+        return {
+            "build_success": exit_code >= 0,
+            "exit_code": exit_code,
+            "logs": combined,
+            "discovered_path": None,
+        }
+
     @staticmethod
     def _is_exec_error(exit_code: int, logs: str) -> bool:
         """
@@ -554,19 +689,255 @@ class DockerAuditor:
 
         return original
 
+    def _discover_repo_py_files(
+        self,
+        client: "docker.DockerClient",
+        image_tag: str,
+    ) -> list[str]:
+        """
+        Spin up a throwaway container from ``image_tag`` and run::
+
+            find . -maxdepth 2 -name "*.py"
+
+        from ``/workspace/repo`` to enumerate Python files actually present
+        inside the cloned repository.
+
+        Returns a deduplicated list of repo-relative POSIX paths
+        (e.g. ``["src/train.py", "app.py"]``).  Returns an empty list on any
+        error so callers can fall back gracefully.
+        """
+        try:
+            raw: bytes = client.containers.run(
+                image=image_tag,
+                command=["find", ".", "-maxdepth", "2", "-name", "*.py"],
+                working_dir="/workspace/repo",
+                remove=True,
+                stdout=True,
+                stderr=False,
+                network_disabled=True,
+            )
+            result: list[str] = []
+            seen: set[str] = set()
+            for line in raw.decode("utf-8", errors="replace").splitlines():
+                p = line.strip()
+                if p.startswith("./"):
+                    p = p[2:]
+                p = p.strip("/")
+                if (
+                    p
+                    and p not in seen
+                    and _ENTRY_POINT_RE.match(p)
+                    and ".." not in p
+                ):
+                    seen.add(p)
+                    result.append(p)
+            logger.info(
+                "[self-heal] find discovered %d .py paths: %s",
+                len(result), result[:12],
+            )
+            return result
+        except (APIError, DockerException) as exc:
+            logger.warning("[self-heal] file discovery container failed: %s", exc)
+            return []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[self-heal] file discovery unexpected error: %s", exc)
+            return []
+
+    @staticmethod
+    def _split_entry_path(path: str) -> tuple[str, str]:
+        """
+        Split a repo-relative path into ``(filename, directory)``.
+
+        Examples
+        --------
+        ``"src/train.py"`` → ``("train.py", "src")``
+        ``"main.py"``      → ``("main.py", "")``
+        """
+        if "/" in path:
+            directory, filename = path.rsplit("/", 1)
+            return filename, directory
+        return path, ""
+
+    @staticmethod
+    def _pick_entry_from_discovered(
+        discovered_files: list[str],
+        original_entry: str,
+    ) -> tuple[str, str, Optional[str]]:
+        """
+        Select the best entry-point from paths returned by
+        :meth:`_discover_repo_py_files`.
+
+        Scoring rules (applied in order):
+
+        1. Exclude obvious non-entry-point names: ``__init__``, ``setup``,
+           ``conftest``, ``test_*``.
+        2. Sort survivors by ``_ENTRY_PRIORITY_STEMS`` (``train`` beats
+           ``run`` beats ``main`` …), then by directory depth (shallower
+           is better — a root-level script is preferred over a nested one
+           with the same stem).
+        3. Pick the highest-ranked result.
+
+        Returns
+        -------
+        (entry_filename, workdir_suffix, discovered_path)
+            * ``entry_filename`` — the bare script name for ``CMD``.
+            * ``workdir_suffix`` — the sub-directory for ``WORKDIR`` (empty
+              string means repo root).
+            * ``discovered_path`` — the full repo-relative path to record in
+              the Scorecard (e.g. ``"src/train.py"``).
+              ``None`` when no distinct candidate was found.
+        """
+        if not discovered_files:
+            filename, suffix = DockerAuditor._split_entry_path(original_entry)
+            return filename, suffix, None
+
+        _EXCLUDE_STEMS = frozenset({
+            "__init__", "setup", "conftest", "__main__",
+        })
+
+        def _is_plausible(path: str) -> bool:
+            stem = path.rsplit("/", 1)[-1].replace(".py", "").lower()
+            return stem not in _EXCLUDE_STEMS and not stem.startswith("test_")
+
+        plausible = [f for f in discovered_files if _is_plausible(f)]
+        if not plausible:
+            plausible = list(discovered_files)
+
+        def _sort_key(path: str) -> tuple[int, int]:
+            stem = path.rsplit("/", 1)[-1].replace(".py", "").lower()
+            depth = path.count("/")
+            for i, prefix in enumerate(_ENTRY_PRIORITY_STEMS):
+                if stem.startswith(prefix):
+                    return i, depth
+            return len(_ENTRY_PRIORITY_STEMS), depth
+
+        plausible.sort(key=_sort_key)
+        best = plausible[0]
+        entry_filename, workdir_suffix = DockerAuditor._split_entry_path(best)
+        return entry_filename, workdir_suffix, best
+
+    def _self_heal_with_discovery(
+        self,
+        client: "docker.DockerClient",
+        built_image_tag: str,
+        github_url: str,
+        deps: list[str],
+        original_entry: str,
+        raw_markdown: str,
+        prior_logs: str,
+    ) -> dict[str, Any]:
+        """
+        Repository-aware self-healing: introspect the repo, pick the right
+        entry point, update the ``WORKDIR``, and retry once.
+
+        Strategy
+        --------
+        **Phase A — File-system discovery** (highest confidence):
+            Run ``find . -maxdepth 2 -name "*.py"`` inside a throwaway
+            container spawned from the already-built image.  This gives the
+            actual on-disk layout of the cloned repo and is immune to errors
+            in the LLM extraction or the DI OCR.
+
+        **Phase B — DI Markdown fallback** (lower confidence):
+            If the Docker discovery returns no results (daemon error, empty
+            repo), fall back to re-parsing the raw Document Intelligence
+            Markdown for ``python <script.py>`` invocations and bare
+            ``.py`` filenames.
+
+        **Phase C — Rebuild and re-run**:
+            Regenerate the Dockerfile with the corrected ``WORKDIR`` and
+            ``CMD``, build once, run once.  The caller is responsible for
+            cleaning up ``built_image_tag`` (via ``_safe_remove_image``).
+
+        Returns
+        -------
+        dict
+            Standard ``run_audit`` result dict augmented with
+            ``"discovered_path"`` (the repo-relative path located by the
+            healer, or ``None`` when no actionable candidate was found).
+        """
+        # ------------------------------------------------------------------
+        # Phase A: introspect the live image's file system
+        # ------------------------------------------------------------------
+        discovered_files = self._discover_repo_py_files(client, built_image_tag)
+
+        # ------------------------------------------------------------------
+        # Phase B: select the best candidate
+        # ------------------------------------------------------------------
+        if discovered_files:
+            new_entry, workdir_suffix, discovered_path = self._pick_entry_from_discovered(
+                discovered_files, original_entry
+            )
+        else:
+            # Docker discovery failed — fall back to DI Markdown re-parsing.
+            raw_candidate = self._find_entry_point_in_markdown(raw_markdown, original_entry)
+            new_entry, workdir_suffix = self._split_entry_path(raw_candidate)
+            discovered_path = raw_candidate if raw_candidate != original_entry else None
+
+        # Skip the rebuild if nothing actionable changed.
+        if new_entry == original_entry and not workdir_suffix:
+            logger.warning(
+                "[self-heal] no better entry point found (discovery=%d files, "
+                "markdown_fallback=%r) — audit FAIL.",
+                len(discovered_files), discovered_path,
+            )
+            return {
+                "build_success": False,
+                "exit_code": -1,
+                "logs": (
+                    f"{prior_logs}\n"
+                    "[self-heal] exec error confirmed; no alternative entry point "
+                    "found — audit FAIL."
+                ),
+                "discovered_path": None,
+            }
+
+        logger.info(
+            "[self-heal] entry_point %r → %r  workdir_suffix=%r  "
+            "discovered_path=%r  rebuilding once.",
+            original_entry, new_entry, workdir_suffix, discovered_path,
+        )
+
+        # ------------------------------------------------------------------
+        # Phase C: rebuild and re-run with the corrected Dockerfile
+        # ------------------------------------------------------------------
+        healed_logs, healed_exit = self._attempt_healed_run(
+            client, github_url, deps, new_entry, workdir_suffix=workdir_suffix
+        )
+        combined = f"{prior_logs}\n--- self-heal ---\n{healed_logs}".strip()
+
+        return {
+            # healed_exit == -1 → healed build itself failed → FAIL
+            "build_success": healed_exit >= 0,
+            "exit_code": healed_exit,
+            "logs": combined,
+            "discovered_path": discovered_path,
+        }
+
     def _attempt_healed_run(
         self,
         client: "docker.DockerClient",
         github_url: str,
         deps: list[str],
         new_entry: str,
+        workdir_suffix: str = "",
     ) -> tuple[str, int]:
         """
-        Regenerate the Dockerfile with ``new_entry`` and execute one full
-        build-then-run cycle.
+        Regenerate the Dockerfile with ``new_entry`` / ``workdir_suffix`` and
+        execute one full build-then-run cycle.
 
         This is the single retry the self-healing policy allows before the
         audit is flagged as ``FAIL``.
+
+        Parameters
+        ----------
+        new_entry:
+            The corrected entry-point filename (just the basename, e.g.
+            ``"train.py"``).
+        workdir_suffix:
+            Sub-directory relative to ``/workspace/repo`` where the script
+            lives (e.g. ``"src"``).  Empty string keeps the WORKDIR at the
+            repo root.
 
         Returns
         -------
@@ -576,11 +947,13 @@ class DockerAuditor:
             executed — the caller decides whether the exit code is acceptable.
         """
         healed_tag = f"auditflow/{uuid.uuid4().hex[:12]}:latest"
-        healed_dockerfile = self._render_dockerfile(github_url, deps, new_entry)
+        healed_dockerfile = self._render_dockerfile(
+            github_url, deps, new_entry, workdir_suffix=workdir_suffix
+        )
 
         logger.info(
-            "[self-heal] rebuilding with corrected entry_point=%r tag=%s",
-            new_entry, healed_tag,
+            "[self-heal] rebuilding: entry_point=%r workdir_suffix=%r tag=%s",
+            new_entry, workdir_suffix, healed_tag,
         )
         logger.debug("[self-heal] healed Dockerfile:\n%s", healed_dockerfile)
 

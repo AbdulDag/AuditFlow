@@ -26,6 +26,7 @@ import os
 import textwrap
 from typing import Any
 
+import docker
 import pypdf
 
 import uvicorn
@@ -45,6 +46,7 @@ from models.scorecard import (
     PaperMetadata,
     ReproducibilityScorecard,
 )
+from services.healer import SelfHealingLoop
 from services.sandbox import DockerAuditor
 
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +92,27 @@ else:
     logger.warning("AZURE_OPENAI_* not set — LLM extraction disabled.")
 
 # Single shared sandbox; the DockerAuditor itself is stateless.
-_auditor = DockerAuditor()
+# When Azure OpenAI credentials are present we also attach the GPT-4o
+# Self-Healing Loop so the auditor can autonomously diagnose and repair
+# Docker build / run failures before returning a FAIL result.
+_healer: SelfHealingLoop | None = None
+if _oai_client is not None:
+    try:
+        _docker_client_for_healer = docker.from_env()
+        _healer = SelfHealingLoop(
+            oai_client=_oai_client,
+            deployment=AZURE_OAI_DEPLOY,
+            docker_client=_docker_client_for_healer,
+            base_image="python:3.10-slim",
+        )
+        logger.info("GPT-4o Self-Healing Loop initialised (deployment=%s).", AZURE_OAI_DEPLOY)
+    except Exception as _healer_exc:  # noqa: BLE001
+        logger.warning(
+            "Could not initialise Self-Healing Loop (Docker unavailable?): %s",
+            _healer_exc,
+        )
+
+_auditor = DockerAuditor(healer=_healer)
 
 # ---------------------------------------------------------------------------
 # FastAPI app

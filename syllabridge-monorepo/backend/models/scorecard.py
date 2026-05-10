@@ -89,11 +89,24 @@ class DockerExecutionResult(BaseModel):
         Combined STDOUT/STDERR output (build + runtime) returned to the
         client. The frontend renders this verbatim in a terminal-like
         viewer.
+    discovered_path:
+        Repo-relative path of the entry-point script located by the
+        self-healing file-discovery pass (e.g. ``"src/train.py"``).
+        ``None`` when the initial run succeeded without healing, or when
+        healing fell back to DI-Markdown re-parsing without a confirmed
+        on-disk path.
     """
 
     build_success: bool = Field(..., description="Did `docker build` succeed?")
     exit_code: int = Field(..., description="Container exit code (-1 if never ran).")
     logs: str = Field("", description="Combined build + runtime logs.")
+    discovered_path: Optional[str] = Field(
+        None,
+        description=(
+            "Repo-relative path found by self-healing file discovery, "
+            "e.g. 'src/train.py'. Null when no healing was needed."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
