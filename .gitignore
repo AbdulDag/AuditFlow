@@ -1,61 +1,10 @@
-# ──────────────────────────────────────────────
-# Secrets — NEVER commit these
-# ──────────────────────────────────────────────
-.env
-.env.*
-!.env.example        # keep the template (no real values)
-*.pem
-*.key
-secrets/
+# Next.js build output
+auditflow-app/.next/
+auditflow-app/node_modules/
 
-# ──────────────────────────────────────────────
-# Python
-# ──────────────────────────────────────────────
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-.Python
-venv/
-env/
-.venv/
-pip-wheel-metadata/
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
+# Stray nested repo
+AuditFlow/
 
-# ──────────────────────────────────────────────
-# Node / npm
-# ──────────────────────────────────────────────
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
-# ──────────────────────────────────────────────
-# Vite / frontend build artifacts
-# ──────────────────────────────────────────────
-syllabridge-monorepo/frontend/dist/
-syllabridge-monorepo/frontend/.vite/
-
-# ──────────────────────────────────────────────
-# OS / editor
-# ──────────────────────────────────────────────
+# OS
 .DS_Store
 Thumbs.db
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# ──────────────────────────────────────────────
-# Test PDFs / personal files (not part of the project)
-# ──────────────────────────────────────────────
-*.pdf
