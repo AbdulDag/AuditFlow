@@ -106,7 +106,7 @@ class DockerAuditor:
         base_image: str = "python:3.10-slim",
         mem_limit: str = "1g",
         run_timeout_seconds: int = 120,
-        build_timeout_seconds: int = 600,
+        build_timeout_seconds: int = 180,
     ) -> None:
         self.base_image = base_image
         self.mem_limit = mem_limit

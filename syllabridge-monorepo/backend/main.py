@@ -18,6 +18,7 @@ behaviour exactly as documented.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -268,29 +269,24 @@ def _llm_extract_metadata(markdown_content: str) -> PaperMetadata | None:
 # Azure Document Intelligence — Markdown output
 # ---------------------------------------------------------------------------
 
-# Maximum pages sent to Azure DI in a single call. ML papers are never
-# longer than this; capping here avoids per-page image-size rejections
-# from the service on dense, high-DPI PDFs.
-_DI_MAX_PAGES = 30
+# Azure DI F0 (free tier) hard limit. S0 (standard) supports 500 MB so
+# this guard only matters for free-tier users.
+_DI_FREE_TIER_LIMIT_BYTES = 3_500_000  # 3.5 MB — leaves headroom below the 4 MB ceiling
 
 
-def _truncate_pdf(document_bytes: bytes, max_pages: int = _DI_MAX_PAGES) -> bytes:
+def _truncate_pdf(document_bytes: bytes, max_pages: int) -> bytes:
     """
     Return a new PDF containing only the first ``max_pages`` pages.
 
-    Uses ``pypdf`` which is a pure-Python, zero-subprocess dependency.
     If the document already has ≤ ``max_pages`` pages the original bytes
-    are returned unchanged (no re-encode overhead).
+    are returned unchanged.
     """
     reader = pypdf.PdfReader(io.BytesIO(document_bytes))
     total = len(reader.pages)
     if total <= max_pages:
         return document_bytes
 
-    logger.info(
-        "PDF has %d pages — truncating to first %d before sending to Azure DI.",
-        total, max_pages,
-    )
+    logger.info("PDF has %d pages — truncating to first %d.", total, max_pages)
     writer = pypdf.PdfWriter()
     for page in reader.pages[:max_pages]:
         writer.add_page(page)
@@ -299,6 +295,35 @@ def _truncate_pdf(document_bytes: bytes, max_pages: int = _DI_MAX_PAGES) -> byte
     writer.write(buf)
     buf.seek(0)
     return buf.read()
+
+
+def _fit_pdf_to_limit(document_bytes: bytes) -> bytes:
+    """
+    Progressively shrink the PDF by halving the page count until it fits
+    within ``_DI_FREE_TIER_LIMIT_BYTES``.
+
+    Page schedule tried: full doc → 20 → 10 → 5 → 3 pages.
+    For ML papers the abstract + intro (first 3–5 pages) always contain
+    the GitHub URL and the key library references, so even the most
+    aggressive cut still produces a useful extraction.
+
+    Returns the smallest version that fits, or the 3-page version as a
+    last resort (Azure DI will return whatever it can parse).
+    """
+    reader = pypdf.PdfReader(io.BytesIO(document_bytes))
+    total_pages = len(reader.pages)
+
+    for max_pages in [total_pages, 20, 10, 5, 3]:
+        candidate = _truncate_pdf(document_bytes, max_pages=max_pages)
+        size_mb = len(candidate) / 1_000_000
+        logger.info(
+            "PDF candidate: %d pages, %.2f MB.", min(max_pages, total_pages), size_mb
+        )
+        if len(candidate) <= _DI_FREE_TIER_LIMIT_BYTES:
+            return candidate
+
+    # Absolute fallback — 3-page slice (won't exceed 3.5 MB for any sane PDF)
+    return _truncate_pdf(document_bytes, max_pages=3)
 
 
 def _call_azure_di(client: DocumentIntelligenceClient, pdf_bytes: bytes) -> str:
@@ -312,47 +337,55 @@ def _call_azure_di(client: DocumentIntelligenceClient, pdf_bytes: bytes) -> str:
     return poller.result().content or ""
 
 
+def _is_content_length_error(exc: HttpResponseError) -> bool:
+    """Return True iff ``exc`` is an Azure DI InvalidContentLength rejection."""
+    inner = exc.error.innererror if exc.error else None
+    return (getattr(inner, "code", "") or "") == "InvalidContentLength"
+
+
 def _analyze_document_as_markdown(document_bytes: bytes) -> str:
     """
     Send the PDF to Azure Document Intelligence (prebuilt-layout) and
-    request Markdown output. Tables are rendered as pipe-table Markdown,
-    which gives gpt-4o a clean, structured view of repo URLs and code
-    listings.
+    request Markdown output.
 
     Strategy
     --------
-    1. Always truncate the PDF to ``_DI_MAX_PAGES`` pages first using
-       ``pypdf``. High-DPI pages on large PDFs cause Azure DI to raise
-       ``InvalidContentLength`` even when the raw file size is within
-       the tier limit — fewer pages = smaller rendered images.
-    2. If Azure DI still rejects the truncated document, retry with only
-       the first 10 pages (abstract + introduction cover the repo URL and
-       key dependencies for virtually every ML paper).
+    1. Pre-shrink the PDF with ``_fit_pdf_to_limit`` — progressively
+       halves the page count (full → 20 → 10 → 5 → 3 pages) until the
+       file sits below ``_DI_FREE_TIER_LIMIT_BYTES`` (3.5 MB). This
+       handles free-tier (F0, 4 MB cap) users transparently.
+    2. If Azure DI still rejects with ``InvalidContentLength`` (e.g.
+       the first 3 pages somehow still render too large), retry with a
+       3-page hard-capped slice as a last resort.
+    3. Any other Azure error is re-raised so the endpoint can surface it.
 
-    Returns the full Markdown string from ``result.content``.
+    On S0 (Standard) tier the pre-shrink still runs but the PDF will
+    almost always pass the size check at the first candidate, so only one
+    Azure call is made.
     """
     client = DocumentIntelligenceClient(
         endpoint=AZURE_DI_ENDPOINT,
         credential=AzureKeyCredential(AZURE_DI_KEY),
     )
 
-    # Primary attempt — first _DI_MAX_PAGES pages.
-    truncated = _truncate_pdf(document_bytes, max_pages=_DI_MAX_PAGES)
-    try:
-        return _call_azure_di(client, truncated)
-    except HttpResponseError as exc:
-        inner = (exc.error.innererror if exc.error else None)
-        inner_code = getattr(inner, "code", "") or ""
-        if inner_code != "InvalidContentLength":
-            raise  # not a size issue — let the caller handle it
-
-    # Fallback — first 10 pages only.
-    logger.warning(
-        "Azure DI rejected %d-page PDF (%d bytes). Retrying with first 10 pages.",
-        len(pypdf.PdfReader(io.BytesIO(truncated)).pages),
-        len(truncated),
+    fitted = _fit_pdf_to_limit(document_bytes)
+    logger.info(
+        "Submitting %.2f MB PDF to Azure DI.", len(fitted) / 1_000_000
     )
-    minimal = _truncate_pdf(document_bytes, max_pages=10)
+
+    try:
+        return _call_azure_di(client, fitted)
+    except HttpResponseError as exc:
+        if not _is_content_length_error(exc):
+            raise
+
+    # Last-resort: 3 pages only — covers abstract + intro for any paper
+    logger.warning(
+        "Azure DI still rejected after pre-shrink (%.2f MB). "
+        "Retrying with 3 pages only.",
+        len(fitted) / 1_000_000,
+    )
+    minimal = _truncate_pdf(document_bytes, max_pages=3)
     return _call_azure_di(client, minimal)
 
 
@@ -435,7 +468,29 @@ async def audit(file: UploadFile = File(...)) -> AuditResponse:
         )
 
     # --- 4. Docker sandbox audit -------------------------------------------
-    audit_result = _auditor.run_audit(metadata)
+    # run_audit is synchronous (Docker SDK uses blocking I/O). Running it
+    # directly in an async handler would freeze the entire event loop for the
+    # duration of the build + run — potentially 10+ minutes. asyncio.to_thread
+    # offloads it to a worker thread so FastAPI stays responsive. The outer
+    # wait_for enforces a hard 5-minute wall-clock ceiling so a runaway build
+    # can never permanently hang the server.
+    _AUDIT_TIMEOUT_SECONDS = 300  # 5 minutes total (build + run)
+    try:
+        audit_result = await asyncio.wait_for(
+            asyncio.to_thread(_auditor.run_audit, metadata),
+            timeout=_AUDIT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Docker audit timed out after %ds.", _AUDIT_TIMEOUT_SECONDS)
+        audit_result = {
+            "build_success": False,
+            "exit_code": -1,
+            "logs": (
+                f"[auditflow] audit timed out after {_AUDIT_TIMEOUT_SECONDS}s. "
+                "The repository may require a very long build or the Docker daemon "
+                "is unavailable. Try a smaller paper or check Docker Desktop."
+            ),
+        }
 
     try:
         execution = DockerExecutionResult(**audit_result)
