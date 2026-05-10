@@ -7,10 +7,12 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // Forward API calls to the FastAPI backend during local development
-      // so the frontend can use relative `/api/...` URLs.
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://localhost:8001",
+        changeOrigin: true,
+      },
+      "/en-US": {
+        target: "http://localhost:8001",
         changeOrigin: true,
       },
     },

@@ -95,7 +95,7 @@ _auditor = DockerAuditor()
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="AuditFlow API", version="1.0.0")
+app = FastAPI(title="AuditFlow API", version="1.0.0", redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -477,4 +477,4 @@ async def health() -> dict[str, str]:
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
