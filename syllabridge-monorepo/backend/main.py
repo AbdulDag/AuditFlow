@@ -531,11 +531,39 @@ async def audit(file: UploadFile = File(...)) -> AuditResponse:
 
     scorecard = ReproducibilityScorecard(metadata=metadata, execution=execution)
 
+    # --- 5. Generate "Why this score?" justification ----------------------
+    # Runs as a separate GPT-4o call after the audit so it can synthesise
+    # the final score, the raw logs, and the agent's reasoning into a
+    # 3-paragraph Markdown explanation for the researcher.  Skipped when
+    # no Azure OpenAI agent is configured (credentials missing or Docker
+    # was unavailable at startup).
+    justification: str | None = None
+    if _agent is not None:
+        try:
+            justification = await asyncio.to_thread(
+                _agent.generate_justification,
+                reproducibility_index=scorecard.reproducibility_index,
+                logs=execution.logs,
+                metadata_claims={
+                    "github_url": metadata.github_url,
+                    "dependencies": metadata.dependencies,
+                    "entry_point": metadata.entry_point,
+                },
+                reasoning_log=execution.reasoning_log,
+                attempted_fixes=execution.attempted_fixes,
+                terminal_signal=execution.terminal_signal,
+            )
+        except Exception as _just_exc:  # noqa: BLE001
+            logger.warning(
+                "generate_justification raised unexpectedly: %s", _just_exc
+            )
+
     return AuditResponse(
         scorecard=scorecard,
         source=source,
         error=None if execution.build_success else
               "Docker build failed — see logs for details.",
+        justification=justification,
     )
 
 

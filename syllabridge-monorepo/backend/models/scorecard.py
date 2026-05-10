@@ -150,6 +150,16 @@ class DockerExecutionResult(BaseModel):
             "or null when the agent was not invoked."
         ),
     )
+    executed_real_script: bool = Field(
+        True,
+        description=(
+            "True when the Dockerfile CMD executed a real .py file from the "
+            "cloned repository (e.g. ['python', 'train.py']). "
+            "False when the agent used 'python -c' or any other inline "
+            "expression - such runs do NOT earn the 60-point runtime bonus "
+            "regardless of exit code."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +175,10 @@ class ReproducibilityScorecard(BaseModel):
     to reason about during a manual audit:
 
         * +40 points if the Docker image builds cleanly.
-        * +60 points if the container exits with status 0.
+        * +60 points if the container exits with status 0 **and** the
+          Dockerfile CMD executed a real ``.py`` file from the repository
+          (``executed_real_script=True``).  Runs that exit 0 via a
+          trivial ``python -c`` inline expression earn 0 runtime points.
 
     The index is recomputed from the underlying fields on every
     serialization via ``@computed_field``, so callers never have to set
@@ -219,7 +232,10 @@ class ReproducibilityScorecard(BaseModel):
         score = 0.0
         if execution.build_success:
             score += BUILD_SUCCESS_POINTS
-        if execution.exit_code == 0:
+        # A perfect runtime score requires BOTH a zero exit code AND
+        # evidence that the container ran a real .py script from the
+        # repository - not a trivial `python -c` expression.
+        if execution.exit_code == 0 and execution.executed_real_script:
             score += EXIT_SUCCESS_POINTS
         return round(score, 2)
 
@@ -249,4 +265,14 @@ class AuditResponse(BaseModel):
     error: Optional[str] = Field(
         None,
         description="Human-readable note about partial failures (e.g. Docker offline).",
+    )
+    justification: Optional[str] = Field(
+        None,
+        description=(
+            "GPT-4o-written 3-paragraph Markdown justification for the score. "
+            "Paragraph 1: Checklist Contradiction (paper claims vs reality). "
+            "Paragraph 2: Technical Bottleneck (specific log errors and agent fixes). "
+            "Paragraph 3: Verdict for the researcher. "
+            "Null when Azure OpenAI is not configured."
+        ),
     )

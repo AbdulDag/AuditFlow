@@ -40,6 +40,7 @@ matching :class:`backend.models.scorecard.DockerExecutionResult`::
         "reasoning_log": list[dict],
         "attempted_fixes": list[dict],
         "terminal_signal": str | None,
+        "executed_real_script": bool,  # False when CMD used python -c
     }
 """
 
@@ -49,17 +50,13 @@ import json
 import logging
 import re
 import shlex
-import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 import docker
 from docker.errors import DockerException
 
 from models.scorecard import PaperMetadata
-from services.diagnostic_agent import DockerBuildRunner
-
-if TYPE_CHECKING:
-    from services.diagnostic_agent import DiagnosticAgent
+from services.diagnostic_agent import DiagnosticAgent, DockerBuildRunner
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +112,7 @@ class DockerAuditor:
         mem_limit: str = "1g",
         run_timeout_seconds: int = 120,
         build_timeout_seconds: int = 180,
-        agent: Optional["DiagnosticAgent"] = None,
+        agent: Optional[DiagnosticAgent] = None,
     ) -> None:
         self.base_image = base_image
         self.mem_limit = mem_limit
@@ -212,6 +209,9 @@ class DockerAuditor:
                 build_success=True,
                 exit_code=exit_code,
                 logs=all_logs,
+                executed_real_script=DiagnosticAgent._dockerfile_runs_real_script(
+                    dockerfile_text
+                ),
             )
 
         # --- 5. Any non-zero exit code triggers the recursive agent.
@@ -277,6 +277,7 @@ class DockerAuditor:
             "reasoning_log": agent_result.reasoning_log,
             "attempted_fixes": agent_result.attempted_fixes,
             "terminal_signal": agent_result.terminal_signal,
+            "executed_real_script": agent_result.executed_real_script,
         }
 
     # ------------------------------------------------------------------
@@ -299,6 +300,7 @@ class DockerAuditor:
             "reasoning_log": [],
             "attempted_fixes": [],
             "terminal_signal": None,
+            "executed_real_script": False,
         }
 
     @staticmethod
@@ -307,6 +309,7 @@ class DockerAuditor:
         build_success: bool,
         exit_code: int,
         logs: str,
+        executed_real_script: bool,
     ) -> dict[str, Any]:
         """Result for the no-intervention happy path."""
         return {
@@ -317,6 +320,7 @@ class DockerAuditor:
             "reasoning_log": [],
             "attempted_fixes": [],
             "terminal_signal": None,
+            "executed_real_script": executed_real_script,
         }
 
     @staticmethod
@@ -335,6 +339,7 @@ class DockerAuditor:
             "reasoning_log": [],
             "attempted_fixes": [],
             "terminal_signal": None,
+            "executed_real_script": False,
         }
 
     # ------------------------------------------------------------------

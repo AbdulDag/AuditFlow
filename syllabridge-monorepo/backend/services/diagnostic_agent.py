@@ -139,6 +139,13 @@ _KNOWN_STRATEGIES: frozenset[str] = frozenset({
 #: the new value applies but every preceding layer is unaffected.
 _CMD_LINE_RE = re.compile(r"^\s*(CMD|ENTRYPOINT)\b", re.IGNORECASE)
 
+#: Extracts the JSON array from a Dockerfile ``CMD`` instruction, e.g.
+#: ``CMD ["python", "train.py"]`` → ``'["python", "train.py"]'``.
+#: Used by :func:`_dockerfile_runs_real_script` to validate that the
+#: container will execute a real repository file rather than a trivial
+#: inline expression.
+_CMD_JSON_RE = re.compile(r'^\s*CMD\s+(\[.+\])\s*$', re.MULTILINE)
+
 #: Lines we consider as the "signature" of a runtime failure when
 #: comparing two error logs.  Anything matching one of these patterns
 #: is the kind of message a human would naturally describe as "the
@@ -387,7 +394,22 @@ from "missing apt package" to "wrong Python version".
 7. When the most recent run reports exit_code == 0, immediately call \
 `submit_final_audit()`.  Do not perform additional probes.
 
-8. If the failure is structurally unfixable (private repo, hard-coded \
+8. NEVER use `python -c "..."` as a solution.  An inline python \
+expression (``-c``) does not execute any code from the repository and \
+does not test reproducibility at all.  The Dockerfile CMD MUST execute \
+a real ``.py`` file that exists inside the cloned repository (e.g. \
+``["python", "main.py"]`` or ``["python", "src/train.py"]``).  A run \
+that exits 0 via a trivial ``python -c "print('done')"`` command earns \
+ZERO runtime points in the scoring rubric - it is treated as a failure. \
+If no runnable ``.py`` file can be identified, respond with \
+CANNOT_FIX instead.
+
+9. Identify the PRIMARY analysis script the paper describes (e.g. \
+``main_run_gpt_judge.py``, ``train.py``, ``eval.py``).  Use \
+``inspect_filesystem`` and ``read_file`` to confirm it exists inside \
+the repo before writing it into CMD.
+
+10. If the failure is structurally unfixable (private repo, hard-coded \
 absolute path that does not exist, broken upstream code), respond with \
 the exact text:  CANNOT_FIX: <one-line reason>
 
@@ -477,6 +499,12 @@ class AgentResult:
     terminal_signal:
         One of ``"submit_final_audit"``, ``"cannot_fix"``,
         ``"max_iterations"``, ``"max_rebuilds"``, ``"agent_error"``.
+    executed_real_script:
+        ``True`` when the Dockerfile's ``CMD`` executes an actual
+        ``.py`` file from the repository (e.g. ``["python", "train.py"]``).
+        ``False`` when the CMD uses ``python -c`` or any other inline
+        expression — such runs exit 0 trivially and must NOT earn the
+        full reproducibility score.
     """
 
     build_success: bool
@@ -486,6 +514,7 @@ class AgentResult:
     reasoning_log: list[dict[str, Any]] = field(default_factory=list)
     attempted_fixes: list[dict[str, Any]] = field(default_factory=list)
     terminal_signal: str = "max_iterations"
+    executed_real_script: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1089,16 @@ class DiagnosticAgent:
         # ``cumulative_logs`` may have been mutated in-place via the
         # _latest_cumulative_logs helper attribute - prefer that.
         final_logs = self._latest_cumulative_logs or cumulative_logs
+        # Validate that the final CMD executes a real repository script
+        # and not a trivial `python -c` expression.  This is the gate
+        # that prevents a fake `python -c "print('done')"` from earning
+        # the 60-point runtime bonus.
+        ran_real_script = self._dockerfile_runs_real_script(current_dockerfile)
+        if not ran_real_script and last_build_success and last_exit_code == 0:
+            logger.warning(
+                "[agent] CMD in final Dockerfile is not a real .py script - "
+                "exit_code=0 will NOT earn runtime points (trivial execution)."
+            )
         return AgentResult(
             build_success=last_build_success,
             exit_code=last_exit_code,
@@ -1068,6 +1107,7 @@ class DiagnosticAgent:
             reasoning_log=[step.to_dict() for step in reasoning_log],
             attempted_fixes=[h.to_dict() for h in attempted_fixes],
             terminal_signal=terminal_signal,
+            executed_real_script=ran_real_script,
         )
 
     # ------------------------------------------------------------------
@@ -1378,6 +1418,197 @@ class DiagnosticAgent:
             pass
 
     # ------------------------------------------------------------------
+    # Public: score justification
+    # ------------------------------------------------------------------
+
+    def generate_justification(
+        self,
+        *,
+        reproducibility_index: float,
+        logs: str,
+        metadata_claims: dict[str, Any],
+        reasoning_log: list[dict[str, Any]],
+        attempted_fixes: list[dict[str, Any]],
+        terminal_signal: Optional[str],
+    ) -> str:
+        """
+        Generate a 3-paragraph Markdown justification for a reproducibility
+        score using GPT-4o.
+
+        This is a **post-audit** call that runs after
+        :meth:`diagnose_and_repair` (or after a clean first-run success).
+        It receives the final score and every artefact the pipeline
+        produced, then instructs GPT-4o to write a structured editorial
+        that the React frontend renders in a *"Why this score?"* section.
+
+        Parameters
+        ----------
+        reproducibility_index:
+            The 0-100 float score already computed by
+            :class:`~models.scorecard.ReproducibilityScorecard`.
+        logs:
+            Combined build + runtime logs (may include agent-attempt
+            sections).  Truncated before being forwarded to keep the
+            prompt lean.
+        metadata_claims:
+            Dict derived from :class:`~models.scorecard.PaperMetadata`
+            (``github_url``, ``dependencies``, ``entry_point``).  These
+            represent the claims the paper makes about its own
+            reproducibility.
+        reasoning_log:
+            Ordered list of ``ReasoningStep`` dicts from the diagnostic
+            loop.  Summarised into a compact trace for the prompt.
+        attempted_fixes:
+            Ordered list of ``Hypothesis`` dicts.  Included so GPT-4o
+            can name specific strategies that succeeded or failed.
+        terminal_signal:
+            How the diagnostic loop ended, or ``None`` when no agent
+            ran (clean first-run success).
+
+        Returns
+        -------
+        str
+            A Markdown string with exactly three paragraphs:
+
+            **Paragraph 1 — Checklist Contradiction**: what the paper
+            claims vs what the runtime revealed.
+
+            **Paragraph 2 — Technical Bottleneck**: the specific log
+            errors / root causes encountered, plus any agent fixes
+            applied.
+
+            **Paragraph 3 — Verdict**: a direct statement for the
+            researcher about what this score means in practice.
+
+            On LLM failure returns a plain-text fallback so the field
+            is always populated.
+        """
+        # ── Prepare compact context ──────────────────────────────────
+        truncated_logs = self._truncate_head(logs, 3_000)
+
+        claimed_deps = metadata_claims.get("dependencies") or []
+        claimed_entry = metadata_claims.get("entry_point") or "main.py"
+        claimed_url = metadata_claims.get("github_url") or "(none)"
+
+        fix_summary = ""
+        if attempted_fixes:
+            lines = []
+            for fx in attempted_fixes:
+                outcome = "succeeded" if fx.get("rebuild_succeeded") and fx.get("exit_code") == 0 else "failed"
+                lines.append(
+                    f"  - [{fx.get('category', 'other')}] "
+                    f"{fx.get('description', '')} → {outcome}"
+                )
+            fix_summary = "\n".join(lines)
+        else:
+            fix_summary = "  (no agent fixes were attempted)"
+
+        loop_outcome = {
+            "submit_final_audit": "Agent fixed the environment and the code ran successfully.",
+            "cannot_fix": "Agent determined the failure is structurally unfixable.",
+            "max_iterations": "Agent exhausted its iteration budget without a successful run.",
+            "max_rebuilds": "Agent exhausted its rebuild quota without a successful run.",
+            "agent_error": "Agent encountered an internal error.",
+            None: "No agent intervention was needed (code ran on first attempt).",
+        }.get(terminal_signal, f"Agent loop ended with signal: {terminal_signal!r}.")
+
+        score_label = (
+            "perfect (fully reproducible)"
+            if reproducibility_index == 100
+            else "partial (build succeeded but runtime failed)"
+            if reproducibility_index == 40
+            else "zero (could not build or run)"
+            if reproducibility_index == 0
+            else f"{reproducibility_index}/100"
+        )
+
+        prompt = f"""\
+You are a scientific reproducibility auditor writing a structured \
+report for a researcher who submitted an ML paper PDF to AuditFlow, \
+an automated reproducibility system.
+
+AUDIT RESULTS
+=============
+Reproducibility score : {reproducibility_index}/100 ({score_label})
+Diagnostic loop outcome: {loop_outcome}
+
+PAPER'S CLAIMED ARTEFACTS
+--------------------------
+GitHub URL  : {claimed_url}
+Entry point : {claimed_entry}
+Dependencies: {', '.join(claimed_deps) if claimed_deps else '(none listed)'}
+
+AGENT FIX ATTEMPTS
+------------------
+{fix_summary}
+
+RUNTIME LOGS (truncated)
+------------------------
+{truncated_logs}
+
+INSTRUCTIONS
+============
+Write EXACTLY THREE paragraphs in Markdown.  Use the headings below \
+verbatim.  Be specific: cite actual error messages, filenames, and \
+package names from the logs above.  Do not invent information not \
+present in the logs.
+
+### Checklist Contradiction
+Explain the gap between what the paper claims (the artefacts listed \
+above) and what the runtime actually found.  If the code ran \
+successfully, explain what the paper promised and that it delivered.
+
+### Technical Bottleneck
+Describe the specific technical errors encountered (exact error \
+messages, missing modules, path issues, build failures).  If the \
+agent applied fixes, name them and state whether they succeeded.  \
+If the code ran cleanly, state that no technical barriers were found.
+
+### Verdict
+One direct paragraph addressed to the researcher.  State what the \
+score means in practice: whether the paper is reproducible as \
+written, what a reader would need to change to run it, and what \
+the highest-priority fix is (if any).
+
+Output ONLY the three Markdown paragraphs.  No preamble, no \
+trailing commentary.\
+"""
+
+        messages: list[dict] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise scientific reproducibility auditor. "
+                    "You write concise, evidence-based reports in Markdown. "
+                    "You never invent errors or fixes not present in the data."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = self._call_llm_simple(messages, max_tokens=600)
+            justification = (response.choices[0].message.content or "").strip()
+            if justification:
+                return justification
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[agent] generate_justification LLM call failed: %s", exc)
+
+        # Fallback: always return something renderable.
+        return (
+            f"### Checklist Contradiction\n"
+            f"The paper links to `{claimed_url}` and lists "
+            f"{len(claimed_deps)} dependencies. "
+            f"AuditFlow attempted to clone and execute `{claimed_entry}`.\n\n"
+            f"### Technical Bottleneck\n"
+            f"The audit completed with score **{reproducibility_index}/100**. "
+            f"Detailed logs are available in the execution panel above.\n\n"
+            f"### Verdict\n"
+            f"The justification model was unavailable. "
+            f"Please review the raw logs to assess reproducibility."
+        )
+
+    # ------------------------------------------------------------------
     # LLM call with exponential back-off + full jitter
     # ------------------------------------------------------------------
 
@@ -1411,6 +1642,39 @@ class DiagnosticAgent:
                 )
                 time.sleep(sleep_time)
         raise RuntimeError("[agent] _call_llm_with_backoff exhausted")  # pragma: no cover
+
+    def _call_llm_simple(
+        self, messages: list[dict], max_tokens: int = 64
+    ) -> Any:
+        """
+        Call GPT-4o for a **plain text** response with no tool schema.
+
+        Used by :meth:`generate_justification` where we want prose back,
+        not a function call.  Applies the same exponential back-off +
+        full-jitter retry policy as :meth:`_call_llm_with_backoff`.
+        """
+        for attempt in range(_BACKOFF_MAX_RETRIES + 1):
+            try:
+                return self._oai.chat.completions.create(
+                    model=self._deployment,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=max_tokens,
+                )
+            except RateLimitError as exc:
+                if attempt >= _BACKOFF_MAX_RETRIES:
+                    raise
+                cap = min(_BACKOFF_MAX, _BACKOFF_BASE ** attempt)
+                sleep_time = random.uniform(0, cap)
+                logger.warning(
+                    "[agent] 429 on simple call (attempt %d/%d) - "
+                    "sleeping %.1fs.",
+                    attempt + 1,
+                    _BACKOFF_MAX_RETRIES,
+                    sleep_time,
+                )
+                time.sleep(sleep_time)
+        raise RuntimeError("[agent] _call_llm_simple exhausted")  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Misc helpers
@@ -1460,6 +1724,49 @@ class DiagnosticAgent:
     def _first_line(text: str) -> str:
         first = text.strip().splitlines()[0] if text.strip() else ""
         return first[:200]
+
+    @staticmethod
+    def _dockerfile_runs_real_script(dockerfile: str) -> bool:
+        """
+        Return ``True`` when the Dockerfile's ``CMD`` executes a real
+        ``.py`` file from the cloned repository.
+
+        Returns ``False`` (trivial / forbidden) when any of the following
+        are true:
+
+        * The CMD contains ``-c`` as an argument (inline Python expression
+          like ``python -c "print('done')"``).
+        * The CMD's script argument does not end in ``.py``.
+        * No ``CMD`` line with a parseable JSON array is present.
+
+        Examples
+        --------
+        >>> _dockerfile_runs_real_script('CMD ["python", "train.py"]')
+        True
+        >>> _dockerfile_runs_real_script('CMD ["python", "src/run.py"]')
+        True
+        >>> _dockerfile_runs_real_script('CMD ["python", "-c", "print(1)"]')
+        False
+        >>> _dockerfile_runs_real_script('CMD ["python", "start"]')
+        False
+        """
+        match = _CMD_JSON_RE.search(dockerfile)
+        if not match:
+            return False
+        try:
+            cmd = json.loads(match.group(1))
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(cmd, list) or len(cmd) < 2:
+            return False
+        # Forbid any -c flag anywhere in the command vector.
+        if "-c" in cmd:
+            return False
+        # The script argument (first token after the interpreter) must be
+        # a path ending in .py.  This catches "python main.py" but not
+        # "python -m module" or bare entrypoints without an extension.
+        script_arg = cmd[1]
+        return isinstance(script_arg, str) and script_arg.endswith(".py")
 
     @staticmethod
     def _extract_error_signature(text: str) -> str:
