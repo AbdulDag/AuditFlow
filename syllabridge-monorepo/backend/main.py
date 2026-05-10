@@ -124,13 +124,25 @@ _auditor = DockerAuditor(agent=_agent)
 
 app = FastAPI(title="AuditFlow API", version="1.0.0")
 
+def _parse_cors_origins() -> list[str]:
+    """Comma-separated extra origins from AUDITFLOW_CORS_ORIGINS."""
+    raw = _env("AUDITFLOW_CORS_ORIGINS")
+    if not raw:
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+_DEFAULT_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:5173",  # Vite default
-    ],
+    allow_origins=list(dict.fromkeys(_DEFAULT_ORIGINS + _parse_cors_origins())),
     allow_origin_regex=r"chrome-extension://.*",
     allow_credentials=True,
     allow_methods=["*"],
@@ -516,6 +528,11 @@ async def audit(file: UploadFile = File(...)) -> AuditResponse:
                 "The repository may require a very long build or the Docker daemon "
                 "is unavailable. Try a smaller paper or check Docker Desktop."
             ),
+            "discovered_path": None,
+            "reasoning_log": [],
+            "attempted_fixes": [],
+            "terminal_signal": None,
+            "executed_real_script": False,
         }
 
     try:
